@@ -139,6 +139,9 @@ pub struct FilePatch {
     pub leading: Vec<u8>,
     /// 1-based input line of the first hunk (or of the diff header).
     pub report_line: i64,
+    /// Set when a later hunk in this file is malformed. Earlier hunks are
+    /// still applied; GNU patch dies when it reads the bad hunk.
+    pub parse_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,7 +158,18 @@ struct SrcLine {
     nl: bool,
 }
 
-pub fn parse_patch(input: &[u8]) -> Result<Parsed, String> {
+/// `need_header` matches GNU `there_is_another_patch`: a bare ed or normal
+/// script is garbage unless `-e`/`-n`, an explicit filename, or POSIX mode
+/// already supplied the name. `force_normal` and `force_ed` are `-n` and `-e`.
+pub fn parse_patch_ex(
+    input: &[u8],
+    mut need_header: bool,
+    force_normal: bool,
+    force_ed: bool,
+) -> Result<Parsed, String> {
+    if force_normal || force_ed {
+        need_header = false;
+    }
     let lines = split_lines(input);
     if lines.is_empty() {
         return Ok(Parsed {
@@ -170,7 +184,7 @@ pub fn parse_patch(input: &[u8]) -> Result<Parsed, String> {
         if lines[index..].iter().all(|line| line.raw.is_empty()) {
             break;
         }
-        let (file, next) = parse_one(&lines, index)?;
+        let (file, next) = parse_one(&lines, index, need_header, force_normal, force_ed)?;
         if file.is_none() && files.is_empty() {
             return Ok(Parsed {
                 files,
@@ -185,8 +199,11 @@ pub fn parse_patch(input: &[u8]) -> Result<Parsed, String> {
                 trailing_garbage: true,
             });
         }
-        files.push(file.unwrap());
-        if next <= index {
+        let file = file.unwrap();
+        let stop = file.parse_error.is_some();
+        files.push(file);
+        // GNU dies when it reads a bad hunk, so nothing after it is a new file.
+        if stop || next <= index {
             break;
         }
         index = next;
@@ -234,7 +251,17 @@ fn starts_with(line: &SrcLine, prefix: &str) -> bool {
     line.raw.starts_with(prefix.as_bytes())
 }
 
-fn parse_one(lines: &[SrcLine], start: usize) -> Result<(Option<FilePatch>, usize), String> {
+pub fn parse_patch(input: &[u8]) -> Result<Parsed, String> {
+    parse_patch_ex(input, false, false, false)
+}
+
+fn parse_one(
+    lines: &[SrcLine],
+    start: usize,
+    mut need_header: bool,
+    force_normal: bool,
+    force_ed: bool,
+) -> Result<(Option<FilePatch>, usize), String> {
     let mut index = start;
     let mut old_name = None;
     let mut new_name = None;
@@ -265,6 +292,7 @@ fn parse_one(lines: &[SrcLine], start: usize) -> Result<(Option<FilePatch>, usiz
             if saw_header || extended || !hunks.is_empty() {
                 break;
             }
+            need_header = false;
             if let Some((old, new)) = git_pair(trimmed.as_bytes()) {
                 old_name = Some(old);
                 new_name = Some(new);
@@ -339,6 +367,7 @@ fn parse_one(lines: &[SrcLine], start: usize) -> Result<(Option<FilePatch>, usiz
             let (name, _) = fetch_name(rest.as_bytes());
             index_name = name;
             saw_header = true;
+            need_header = false;
             index += 1;
             continue;
         }
@@ -357,6 +386,7 @@ fn parse_one(lines: &[SrcLine], start: usize) -> Result<(Option<FilePatch>, usiz
             new_timestr = timestr;
             new_stamp = stamp;
             saw_header = true;
+            need_header = false;
             index += 1;
             continue;
         }
@@ -366,6 +396,7 @@ fn parse_one(lines: &[SrcLine], start: usize) -> Result<(Option<FilePatch>, usiz
             old_timestr = timestr;
             old_stamp = stamp;
             saw_header = true;
+            need_header = false;
             index += 1;
             continue;
         }
@@ -375,10 +406,15 @@ fn parse_one(lines: &[SrcLine], start: usize) -> Result<(Option<FilePatch>, usiz
             old_timestr = timestr;
             old_stamp = stamp;
             saw_header = true;
+            need_header = false;
             index += 1;
             continue;
         }
         if trimmed.starts_with("@@ -") {
+            if need_header {
+                index += 1;
+                continue;
+            }
             std::mem::swap(&mut old_name, &mut new_name);
             std::mem::swap(&mut old_timestr, &mut new_timestr);
             std::mem::swap(&mut old_stamp, &mut new_stamp);
@@ -392,22 +428,42 @@ fn parse_one(lines: &[SrcLine], start: usize) -> Result<(Option<FilePatch>, usiz
             );
             break;
         }
-        if trimmed.starts_with("***************") || looks_like_context_range(trimmed.as_bytes()) {
-            kind = Some(DiffKind::Context);
-            break;
+        if is_star_separator(&trimmed) && !need_header {
+            if let Some(next) = lines.get(index + 1) {
+                let (next_indent, _) = line_indent(&next.raw);
+                let next_trim = trim_indent(&line_str(next));
+                if next_indent == line_indent(line.raw.as_slice()).0
+                    && looks_like_context_range(next_trim.as_bytes())
+                {
+                    kind = Some(DiffKind::Context);
+                    break;
+                }
+            }
         }
-        if is_normal_command(trimmed.as_bytes()) {
+        if !need_header && is_normal_command(trimmed.as_bytes()) {
             // Look ahead a little: `<` / `>` means normal, a lone `.` means ed.
+            if force_ed && looks_ed_body(lines, index) {
+                kind = Some(DiffKind::Ed);
+                break;
+            }
+            if !force_ed && looks_normal_body(lines, index) {
+                kind = Some(DiffKind::Normal);
+                break;
+            }
+            if looks_ed_body(lines, index) && !force_normal {
+                kind = Some(DiffKind::Ed);
+                break;
+            }
             if looks_normal_body(lines, index) {
                 kind = Some(DiffKind::Normal);
                 break;
             }
-            if looks_ed_body(lines, index) {
-                kind = Some(DiffKind::Ed);
-                break;
-            }
         }
-        if is_ed_command(trimmed.as_bytes()) && looks_ed_body(lines, index) {
+        if !need_header && force_ed && is_ed_command(trimmed.as_bytes()) {
+            kind = Some(DiffKind::Ed);
+            break;
+        }
+        if !need_header && is_ed_command(trimmed.as_bytes()) && looks_ed_body(lines, index) {
             kind = Some(DiffKind::Ed);
             break;
         }
@@ -438,58 +494,54 @@ fn parse_one(lines: &[SrcLine], start: usize) -> Result<(Option<FilePatch>, usiz
         }
     }
 
-    let kind = kind.unwrap();
+    let mut kind = kind.unwrap();
     let hunk_at = index;
     let report_line = lines.get(hunk_at).map(|line| line.num).unwrap_or(1);
     let leading = join_lines(&lines[start..hunk_at.min(lines.len())]);
+    let mut parse_error = None;
 
     match kind {
         DiffKind::Unified => {
             while index < lines.len() && line_str(&lines[index]).trim_start().starts_with("@@ -") {
-                let (hunk, next) = parse_unified_hunk(lines, index)?;
-                hunks.push(hunk);
-                index = next;
+                match parse_unified_hunk(lines, index) {
+                    Ok((hunk, next)) => {
+                        hunks.push(hunk);
+                        index = next;
+                    }
+                    Err(err) => {
+                        parse_error = Some(err);
+                        break;
+                    }
+                }
             }
         }
         DiffKind::Context | DiffKind::NewContext => {
-            let (parsed, next, new_context) = parse_context_hunks(lines, index)?;
-            hunks = parsed;
-            index = next;
-            let kind = if new_context {
-                DiffKind::NewContext
-            } else {
-                kind
-            };
-            return Ok((
-                Some(finish(
-                    kind,
-                    old_name,
-                    new_name,
-                    index_name,
-                    old_timestr,
-                    new_timestr,
-                    old_nonexistent,
-                    new_nonexistent,
-                    old_stamp,
-                    new_stamp,
-                    old_mode,
-                    new_mode,
-                    git,
-                    rename,
-                    copy,
-                    hunks,
-                    ed_script,
-                    leading,
-                    report_line,
-                )),
-                index,
-            ));
+            let parsed = parse_context_hunks(lines, index, old_stamp);
+            hunks = parsed.hunks;
+            index = parsed.index;
+            if parsed.new_context {
+                kind = DiffKind::NewContext;
+            }
+            parse_error = parsed.error;
+            if parsed.old_nonexistent != 0 {
+                old_nonexistent = parsed.old_nonexistent;
+            }
+            if parsed.new_deleted {
+                new_nonexistent = 1 + u8::from(new_stamp == 0);
+            }
         }
         DiffKind::Normal => {
             while index < lines.len() && is_normal_command(line_str(&lines[index]).as_bytes()) {
-                let (hunk, next) = parse_normal_hunk(lines, index)?;
-                hunks.push(hunk);
-                index = next;
+                match parse_normal_hunk(lines, index) {
+                    Ok((hunk, next)) => {
+                        hunks.push(hunk);
+                        index = next;
+                    }
+                    Err(err) => {
+                        parse_error = Some(err);
+                        break;
+                    }
+                }
             }
         }
         DiffKind::Ed => {
@@ -530,30 +582,29 @@ fn parse_one(lines: &[SrcLine], start: usize) -> Result<(Option<FilePatch>, usiz
         DiffKind::GitBinary => {}
     }
 
-    Ok((
-        Some(finish(
-            kind,
-            old_name,
-            new_name,
-            index_name,
-            old_timestr,
-            new_timestr,
-            old_nonexistent,
-            new_nonexistent,
-            old_stamp,
-            new_stamp,
-            old_mode,
-            new_mode,
-            git,
-            rename,
-            copy,
-            hunks,
-            ed_script,
-            leading,
-            report_line,
-        )),
-        index,
-    ))
+    let mut file = finish(
+        kind,
+        old_name,
+        new_name,
+        index_name,
+        old_timestr,
+        new_timestr,
+        old_nonexistent,
+        new_nonexistent,
+        old_stamp,
+        new_stamp,
+        old_mode,
+        new_mode,
+        git,
+        rename,
+        copy,
+        hunks,
+        ed_script,
+        leading,
+        report_line,
+    );
+    file.parse_error = parse_error;
+    Ok((Some(file), index))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -598,6 +649,7 @@ fn finish(
         ed_script,
         leading,
         report_line,
+        parse_error: None,
     }
 }
 
@@ -617,7 +669,56 @@ fn join_lines(lines: &[SrcLine]) -> Vec<u8> {
 }
 
 fn trim_indent(text: &str) -> String {
-    text.trim_start_matches([' ', '\t', 'X']).to_string()
+    let (_, rest) = line_indent(text.as_bytes());
+    String::from_utf8_lossy(&text.as_bytes()[rest..]).into_owned()
+}
+
+/// Visual indent of leading blanks and `X`, matching GNU `intuit_diff_type`.
+fn line_indent(raw: &[u8]) -> (i64, usize) {
+    let mut indent = 0i64;
+    let mut index = 0usize;
+    while index < raw.len() && matches!(raw[index], b' ' | b'\t' | b'X') {
+        if raw[index] == b'\t' {
+            indent = (indent + 8) & !7;
+        } else {
+            indent += 1;
+        }
+        index += 1;
+    }
+    (indent, index)
+}
+
+fn is_star_separator(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut stars = 0usize;
+    while stars < bytes.len() && bytes[stars] == b'*' {
+        stars += 1;
+    }
+    stars >= 8
+}
+
+/// Text after a `********` separator, including the leading blank, without a newline.
+fn star_function(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut stars = 0usize;
+    while stars < bytes.len() && bytes[stars] == b'*' {
+        stars += 1;
+    }
+    if stars < bytes.len() && bytes[stars].is_ascii_whitespace() {
+        bytes[stars..].to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+struct ContextParse {
+    hunks: Vec<Hunk>,
+    index: usize,
+    new_context: bool,
+    error: Option<String>,
+    old_nonexistent: u8,
+    /// First hunk replaced nothing and started at line 1 (a deletion).
+    new_deleted: bool,
 }
 
 fn parse_unified_hunk(lines: &[SrcLine], start: usize) -> Result<(Hunk, usize), String> {
@@ -827,7 +928,9 @@ fn malformed(lines: &[SrcLine], index: usize) -> String {
         .get(index)
         .map(|line| (line.num, line_str(line)))
         .unwrap_or((0, String::new()));
-    format!("malformed patch at line {num}: {text}")
+    // GNU's patch buffer still holds the trailing newline, and `fatal`
+    // appends another, so the message is followed by a blank line.
+    format!("malformed patch at line {num}: {text}\n")
 }
 
 fn scan_linenum(bytes: &[u8], mut index: usize) -> Option<(i64, usize)> {
@@ -1004,177 +1107,516 @@ fn drop_incomplete(text: &mut Vec<u8>, lines: &[SrcLine], index: usize) {
     }
 }
 
-fn parse_context_hunks(
-    lines: &[SrcLine],
-    mut index: usize,
-) -> Result<(Vec<Hunk>, usize, bool), String> {
+fn parse_context_hunks(lines: &[SrcLine], mut index: usize, old_stamp: i64) -> ContextParse {
     let mut hunks = Vec::new();
     let mut new_context = false;
+    let mut pending_function = Vec::new();
+    let mut old_nonexistent = 0u8;
+    let mut new_deleted = false;
+    let mut saw = false;
+    let mut prev_prefix = 0i64;
     while index < lines.len() {
         let text = trim_indent(&line_str(&lines[index]));
-        if text.starts_with("***************") {
+        if is_star_separator(&text) {
+            pending_function = star_function(&text);
             index += 1;
             continue;
         }
         if !looks_like_context_range(text.as_bytes()) {
             break;
         }
-        let (hunk, next, is_new) = parse_context_hunk(lines, index)?;
-        new_context |= is_new;
-        hunks.push(hunk);
-        index = next;
+        match parse_context_hunk(lines, index, old_stamp, prev_prefix) {
+            Ok(mut built) => {
+                built.hunk.c_function = std::mem::take(&mut pending_function);
+                new_context |= built.new_style;
+                prev_prefix = built.hunk.prefix_context;
+                if !saw {
+                    old_nonexistent = built.old_nonexistent;
+                    new_deleted = built.new_deleted;
+                    saw = true;
+                }
+                hunks.push(built.hunk);
+                index = built.next;
+            }
+            Err(err) => {
+                return ContextParse {
+                    hunks,
+                    index,
+                    new_context,
+                    error: Some(err),
+                    old_nonexistent,
+                    new_deleted,
+                };
+            }
+        }
     }
-    Ok((hunks, index, new_context))
+    ContextParse {
+        hunks,
+        index,
+        new_context,
+        error: None,
+        old_nonexistent,
+        new_deleted,
+    }
 }
 
-fn parse_context_hunk(lines: &[SrcLine], start: usize) -> Result<(Hunk, usize, bool), String> {
-    let header = trim_indent(&line_str(&lines[start]));
-    let bytes = header.as_bytes();
-    // "*** start[,end] ****"
-    let mut s = 4usize;
-    while s < bytes.len() && bytes[s] == b' ' {
-        s += 1;
-    }
-    let (start_line, next) = scan_linenum(bytes, s).ok_or_else(|| malformed(lines, start))?;
-    s = next;
-    let (old_first, old_last) = if s < bytes.len() && bytes[s] == b',' {
-        let (last, _) = scan_linenum(bytes, s + 1).ok_or_else(|| malformed(lines, start))?;
-        (start_line, last)
-    } else {
-        (start_line, start_line)
-    };
-    let new_style = header.contains("****");
-    let ptrn_lines = if old_last < old_first {
-        0
-    } else {
-        old_last - old_first + 1
-    };
+struct BuiltContext {
+    hunk: Hunk,
+    next: usize,
+    new_style: bool,
+    old_nonexistent: u8,
+    new_deleted: bool,
+}
+
+fn parse_context_hunk(
+    lines: &[SrcLine],
+    start: usize,
+    old_stamp: i64,
+    prev_prefix: i64,
+) -> Result<BuiltContext, String> {
+    let header_text = trim_indent(&line_str(&lines[start]));
+    let header = header_text.as_bytes();
+    let stars = header_text.contains("****");
+    let indent = line_indent(lines[start].raw.as_slice()).0;
+    let (old_first, ptrn_lines) = context_counts(header).ok_or_else(|| malformed(lines, start))?;
+    let old_nonexistent = zero_range_says(header, old_stamp);
+    let hunk_beg = lines[start].num;
+    let mut slots = vec![Some(marked_line(b'*', header, true))];
     let mut index = start + 1;
-    let mut old_lines = Vec::new();
-    while old_lines.len() < ptrn_lines as usize {
-        if index >= lines.len() {
-            return Err("unexpected end of file in patch".to_string());
+    let mut context = 0i64;
+    let mut ptrn_prefix = -1i64;
+    let mut ptrn_suffix;
+    let mut repl_prefix = -1i64;
+    let mut ptrn_copiable = 0i64;
+    let mut repl_copiable = 0i64;
+    let mut some_context = false;
+    let mut spaces_eaten = false;
+    let mut repl_could_be_missing = true;
+    let mut ptrn_missing = false;
+
+    while index < lines.len() && !is_context_separator(&stripped(&lines[index], indent)) {
+        let body = stripped(&lines[index], indent);
+        if body.starts_with(b"*") {
+            return Err(format!(
+                "unexpected '***' at line {}: {}\n",
+                lines[index].num,
+                line_str(&lines[index])
+            ));
         }
-        let text = line_str(&lines[index]);
-        if trim_indent(&text).starts_with("--- ") {
-            break;
+        let side = ContextSide {
+            repl: false,
+            could_miss: &mut repl_could_be_missing,
+            spaces_eaten: &mut spaces_eaten,
+            prefix: &mut ptrn_prefix,
+            copiable: &mut ptrn_copiable,
+            context: &mut context,
+            some_context: &mut some_context,
+            stars,
+        };
+        match take_context_line(&lines[index], &body, side)? {
+            Take::Line(line) => slots.push(Some(line)),
+            Take::Missing => break,
         }
-        old_lines.push(context_body_line(&lines[index]));
         index += 1;
     }
-    if index >= lines.len() || !trim_indent(&line_str(&lines[index])).starts_with("--- ") {
-        return Err(malformed(lines, index.min(lines.len().saturating_sub(1))));
+    if index >= lines.len() {
+        return Err(format!("no '---' found in patch at line {hunk_beg}"));
     }
-    let new_header = trim_indent(&line_str(&lines[index]));
-    let nb = new_header.as_bytes();
-    let mut s = 4usize;
-    while s < nb.len() && nb[s] == b' ' {
-        s += 1;
+
+    let at = slots.len();
+    if ptrn_prefix < 0 {
+        ptrn_prefix = context;
     }
-    let (nstart, next) = scan_linenum(nb, s).ok_or_else(|| malformed(lines, index))?;
-    s = next;
-    let (new_first, new_last) = if s < nb.len() && nb[s] == b',' {
-        let (last, _) = scan_linenum(nb, s + 1).ok_or_else(|| malformed(lines, index))?;
-        (nstart, last)
-    } else {
-        (nstart, nstart)
-    };
-    let repl_lines = if new_last < new_first {
-        0
-    } else {
-        new_last - new_first + 1
-    };
-    index += 1;
-    let mut new_lines = Vec::new();
-    while new_lines.len() < repl_lines as usize && index < lines.len() {
-        let text = trim_indent(&line_str(&lines[index]));
-        if text.starts_with("*** ")
-            || text.starts_with("***************")
-            || text.starts_with("--- ")
-        {
-            break;
-        }
-        new_lines.push(context_body_line(&lines[index]));
-        index += 1;
-    }
-    let mut hunk_lines = vec![HunkLine {
-        ch: b'*',
-        text: format!("*** {old_first},{old_last}\n").into_bytes(),
-    }];
-    let mut prefix = -1i64;
-    let mut run = 0i64;
-    for (ch, text) in &old_lines {
-        if *ch == b' ' {
-            run += 1;
-        } else if prefix < 0 {
-            prefix = run;
-            run = 0;
+    ptrn_suffix = context;
+    let prev_newline = slots
+        .last()
+        .and_then(|slot| slot.as_ref())
+        .is_some_and(|line| line.ch == b'\n');
+    let expected = ptrn_lines as usize + 1 + usize::from(prev_newline);
+    let mut fillsrc = 0i64;
+    let mut filldst = 0i64;
+    let mut fillcnt = 0i64;
+    if at != expected {
+        if at == 1 {
+            ptrn_missing = true;
+            while slots.len() < ptrn_lines as usize + 1 {
+                slots.push(None);
+            }
+            ptrn_prefix = -1;
+            ptrn_suffix = -1;
+            filldst = 1;
+            fillcnt = ptrn_lines;
+            fillsrc = ptrn_lines + 2;
         } else {
-            run = 0;
+            let which = if at <= ptrn_lines as usize {
+                "Premature"
+            } else {
+                "Overdue"
+            };
+            return Err(format!(
+                "{which} '---' at line {}; check line numbers at line {hunk_beg}",
+                lines[index].num
+            ));
         }
-        hunk_lines.push(HunkLine {
-            ch: *ch,
-            text: text.clone(),
-        });
     }
-    if prefix < 0 {
-        prefix = 0;
+
+    let dash = stripped(&lines[index], indent);
+    let (new_first, repl_lines) = context_counts(&dash).ok_or_else(|| malformed(lines, index))?;
+    let repl_beginning = slots.len();
+    slots.push(Some(marked_line(b'=', &dash, lines[index].nl)));
+    if fillcnt != 0 {
+        fillsrc = repl_beginning as i64 + 1;
     }
-    let suffix = run;
-    hunk_lines.push(HunkLine {
-        ch: b'=',
-        text: format!("--- {new_first},{new_last}\n").into_bytes(),
-    });
-    for (ch, text) in new_lines {
-        hunk_lines.push(HunkLine { ch, text });
+    if repl_lines != ptrn_copiable && (prev_prefix != 0 || context != 0 || repl_lines != 1) {
+        repl_could_be_missing = false;
     }
+    context = 0;
+    index += 1;
+    let repl_at = index;
+    let mut repl_missing = false;
+    let mut got = 0i64;
+    while got < repl_lines {
+        if index >= lines.len() {
+            if repl_could_be_missing {
+                repl_missing = true;
+            } else {
+                return Err("unexpected end of file in patch".to_string());
+            }
+            break;
+        }
+        let body = stripped(&lines[index], indent);
+        if body.starts_with(b"********") || body.starts_with(b"*** ") {
+            if repl_could_be_missing {
+                repl_missing = true;
+                break;
+            }
+            return Err(format!(
+                "unexpected end of hunk at line {}",
+                lines[index].num
+            ));
+        }
+        let side = ContextSide {
+            repl: true,
+            could_miss: &mut repl_could_be_missing,
+            spaces_eaten: &mut spaces_eaten,
+            prefix: &mut repl_prefix,
+            copiable: &mut repl_copiable,
+            context: &mut context,
+            some_context: &mut some_context,
+            stars,
+        };
+        match take_context_line(&lines[index], &body, side)? {
+            Take::Line(line) => {
+                slots.push(Some(line));
+                got += 1;
+                index += 1;
+            }
+            Take::Missing => {
+                repl_missing = true;
+                break;
+            }
+        }
+    }
+    if repl_missing {
+        index = repl_at;
+        fillsrc = 1;
+        filldst = repl_beginning as i64 + 1;
+        fillcnt = repl_lines;
+        while slots.len() <= repl_beginning + repl_lines as usize {
+            slots.push(None);
+        }
+    }
+
+    if !ptrn_missing && !repl_missing && ptrn_copiable != repl_copiable {
+        return Err(format!("context mangled in hunk at line {hunk_beg}"));
+    }
+    let mut ptrn_lines = ptrn_lines;
+    let mut old_first = old_first;
+    if !some_context && fillcnt == 1 {
+        old_first += 1;
+        ptrn_lines = 0;
+        fillcnt = 0;
+    }
+    let prefix = if repl_prefix < 0 || (ptrn_prefix >= 0 && ptrn_prefix < repl_prefix) {
+        ptrn_prefix
+    } else {
+        repl_prefix
+    };
+    let suffix = if ptrn_suffix >= 0 && ptrn_suffix < context {
+        ptrn_suffix
+    } else {
+        context
+    };
+    if prefix < 0 || suffix < 0 {
+        return Err(format!(
+            "replacement text or line numbers mangled in hunk at line {hunk_beg}"
+        ));
+    }
+    if fillcnt != 0 {
+        fill_omitted(&mut slots, fillsrc, filldst, fillcnt, repl_beginning, hunk_beg)?;
+    }
+    let mut hunk_lines: Vec<HunkLine> = slots.into_iter().flatten().collect();
     hunk_lines.push(HunkLine {
         ch: b'^',
         text: Vec::new(),
     });
-    let ptrn_lines = old_lines.len() as i64;
-    let repl_lines = (hunk_lines.len() as i64) - ptrn_lines - 3;
-    Ok((
-        Hunk {
+    let new_style = stars
+        || fillcnt != 0
+        || (old_first > 1 && prefix + suffix < ptrn_copiable);
+    Ok(BuiltContext {
+        hunk: Hunk {
             old_first,
             new_first,
             ptrn_lines,
-            repl_lines: repl_lines.max(0),
+            repl_lines,
             prefix_context: prefix,
             suffix_context: suffix,
             lines: hunk_lines,
             c_function: Vec::new(),
         },
-        index,
+        next: index,
         new_style,
-    ))
+        old_nonexistent,
+        new_deleted: repl_lines == 0 && new_first == 1,
+    })
 }
 
-fn context_body_line(line: &SrcLine) -> (u8, Vec<u8>) {
-    let raw = &line.raw;
-    let (ch, rest) = if raw.is_empty() {
-        (b' ', &raw[..])
-    } else if matches!(raw[0], b' ' | b'-' | b'+' | b'!') {
-        let rest = if raw.len() > 1 && raw[1] == b' ' {
-            &raw[2..]
-        } else if raw.len() > 1 {
-            &raw[1..]
+struct ContextSide<'a> {
+    repl: bool,
+    could_miss: &'a mut bool,
+    spaces_eaten: &'a mut bool,
+    prefix: &'a mut i64,
+    copiable: &'a mut i64,
+    context: &'a mut i64,
+    some_context: &'a mut bool,
+    stars: bool,
+}
+
+enum Take {
+    Line(HunkLine),
+    Missing,
+}
+
+fn take_context_line(
+    line: &SrcLine,
+    body: &[u8],
+    side: ContextSide<'_>,
+) -> Result<Take, String> {
+    let marker = body.first().copied();
+    if matches!(marker, Some(b'+') | Some(b'!')) {
+        *side.could_miss = false;
+    }
+    if matches!(marker, Some(b'+') | Some(b'!') | Some(b'-')) {
+        if *side.prefix < 0 {
+            *side.prefix = *side.context;
+        }
+        *side.context = 0;
+        let (text, odd) = marker_payload(body, line.nl);
+        if side.repl && odd && *side.could_miss {
+            return Ok(Take::Missing);
+        }
+        return Ok(Take::Line(HunkLine {
+            ch: marker.unwrap_or(b' '),
+            text,
+        }));
+    }
+    if marker.is_none() || marker == Some(b'\t') || marker == Some(b' ') {
+        let eaten = marker.is_none() || marker == Some(b'\t');
+        if side.repl && *side.could_miss && eaten && (!*side.spaces_eaten || side.stars) {
+            return Ok(Take::Missing);
+        }
+        let (text, odd) = if eaten {
+            eaten_payload(body, line.nl)
         } else {
-            &raw[..0]
+            marker_payload(body, line.nl)
         };
-        (raw[0], rest)
-    } else {
-        (b' ', raw.as_slice())
-    };
-    let mut text = rest.to_vec();
-    if line.nl {
+        if side.repl && odd && *side.could_miss {
+            return Ok(Take::Missing);
+        }
+        if eaten && side.repl {
+            *side.spaces_eaten = true;
+        }
+        *side.some_context = true;
+        *side.context += 1;
+        *side.copiable += 1;
+        return Ok(Take::Line(HunkLine { ch: b' ', text }));
+    }
+    if side.repl && *side.could_miss {
+        return Ok(Take::Missing);
+    }
+    Err(malformed_at(line))
+}
+
+fn marker_payload(body: &[u8], nl: bool) -> (Vec<u8>, bool) {
+    let mut start = 1usize;
+    let odd = body.get(start).is_some_and(|byte| !is_blank(*byte));
+    if body.get(start).is_some_and(|byte| is_blank(*byte)) {
+        start += 1;
+    }
+    let mut text = body.get(start..).unwrap_or_default().to_vec();
+    if nl {
         text.push(b'\n');
     }
-    (ch, text)
+    (text, odd)
+}
+
+fn eaten_payload(body: &[u8], nl: bool) -> (Vec<u8>, bool) {
+    let start = usize::from(body.first() == Some(&b'\t'));
+    let mut text = body.get(start..).unwrap_or_default().to_vec();
+    if nl {
+        text.push(b'\n');
+    }
+    (text, false)
+}
+
+fn fill_omitted(
+    slots: &mut [Option<HunkLine>],
+    mut fillsrc: i64,
+    mut filldst: i64,
+    mut fillcnt: i64,
+    repl_beginning: usize,
+    hunk_beg: i64,
+) -> Result<(), String> {
+    let repl = repl_beginning as i64;
+    while fillcnt > 0 {
+        while fillsrc < slots.len() as i64
+            && fillsrc != repl
+            && slots.get(fillsrc as usize).and_then(|slot| slot.as_ref()).is_some_and(|line| line.ch != b' ')
+        {
+            fillsrc += 1;
+        }
+        if fillsrc >= slots.len() as i64 || fillsrc == repl {
+            return Err(format!(
+                "replacement text or line numbers mangled in hunk at line {hunk_beg}"
+            ));
+        }
+        let source = slots[fillsrc as usize].clone();
+        if let Some(slot) = slots.get_mut(filldst as usize) {
+            *slot = source;
+        }
+        fillsrc += 1;
+        filldst += 1;
+        fillcnt -= 1;
+    }
+    while fillsrc < slots.len() as i64 && fillsrc != repl {
+        if slots
+            .get(fillsrc as usize)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|line| line.ch == b' ')
+        {
+            return Err(format!(
+                "replacement text or line numbers mangled in hunk at line {hunk_beg}"
+            ));
+        }
+        fillsrc += 1;
+    }
+    Ok(())
+}
+
+fn is_context_separator(body: &[u8]) -> bool {
+    body.len() >= 2 && body[0] == b'-' && body[1] == b'-'
+}
+
+fn stripped(line: &SrcLine, indent: i64) -> Vec<u8> {
+    strip_indent_cols(&line.raw, indent).to_vec()
+}
+
+fn strip_indent_cols(raw: &[u8], indent: i64) -> &[u8] {
+    let mut col = 0i64;
+    let mut index = 0usize;
+    while index < raw.len() && col < indent {
+        match raw[index] {
+            b' ' | b'X' => {
+                col += 1;
+                index += 1;
+            }
+            b'\t' => {
+                col = (col + 8) & !7;
+                index += 1;
+            }
+            _ => break,
+        }
+    }
+    &raw[index..]
+}
+
+fn context_counts(bytes: &[u8]) -> Option<(i64, i64)> {
+    let mut s = 0usize;
+    while s < bytes.len() && !bytes[s].is_ascii_digit() {
+        s += 1;
+        if s > 16 {
+            return None;
+        }
+    }
+    let (mut first, next) = scan_linenum_blank(bytes, s)?;
+    s = next;
+    if s < bytes.len() && bytes[s] == b',' {
+        let (last, _) = scan_linenum_blank(bytes, s + 1)?;
+        if first == 0 && last == 0 {
+            first = 1;
+        }
+        let count = last - first + 1;
+        if count < 0 {
+            return None;
+        }
+        Some((first, count))
+    } else if first == 0 {
+        Some((1, 0))
+    } else {
+        Some((first, 1))
+    }
+}
+
+fn scan_linenum_blank(bytes: &[u8], mut index: usize) -> Option<(i64, usize)> {
+    while index < bytes.len() && is_blank(bytes[index]) {
+        index += 1;
+    }
+    let (value, mut next) = scan_linenum(bytes, index)?;
+    while next < bytes.len() && is_blank(bytes[next]) {
+        next += 1;
+    }
+    Some((value, next))
+}
+
+fn zero_range_says(header: &[u8], stamp: i64) -> u8 {
+    let mut s = 4.min(header.len());
+    while s < header.len() && is_blank(header[s]) {
+        s += 1;
+    }
+    if header.get(s) == Some(&b'0') && header.get(s + 1).is_none_or(|byte| !byte.is_ascii_digit()) {
+        1 + u8::from(stamp == 0)
+    } else {
+        0
+    }
+}
+
+fn marked_line(ch: u8, body: &[u8], nl: bool) -> HunkLine {
+    let mut text = body.to_vec();
+    if nl {
+        text.push(b'\n');
+    }
+    HunkLine { ch, text }
+}
+
+fn malformed_at(line: &SrcLine) -> String {
+    let mut text = String::from_utf8_lossy(&line.raw).into_owned();
+    text.push('\n');
+    format!("malformed patch at line {}: {text}", line.num)
+}
+
+fn is_blank(byte: u8) -> bool {
+    byte == b' ' || byte == b'\t'
 }
 
 fn looks_like_context_range(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"*** ") && bytes.len() > 4 && bytes[4].is_ascii_digit()
+    if !bytes.starts_with(b"*** ") {
+        return false;
+    }
+    let mut index = 4usize;
+    while index < bytes.len() && is_blank(bytes[index]) {
+        index += 1;
+    }
+    index < bytes.len() && bytes[index].is_ascii_digit()
 }
 
 fn is_minus_header(bytes: &[u8]) -> bool {
@@ -1373,7 +1815,69 @@ fn fetch_name_stamp(bytes: &[u8]) -> (Option<String>, String, i64) {
     if name.is_empty() {
         return (None, timestr, -1);
     }
-    (Some(name), timestr, -1)
+    // A timestamp within -25h..+26h of the epoch is forced to 0, matching
+    // fetchname. Only that zero-ness matters until file times are applied.
+    let stamp = if epoch_window(&timestr) { 0 } else { -1 };
+    (Some(name), timestr, stamp)
+}
+
+fn epoch_window(timestr: &str) -> bool {
+    let bytes = timestr.trim_start_matches([' ', '\t']).as_bytes();
+    if bytes.len() < 19 {
+        return false;
+    }
+    let digit = |i: usize| bytes[i].is_ascii_digit();
+    if !(digit(0)
+        && digit(1)
+        && digit(2)
+        && digit(3)
+        && bytes[4] == b'-'
+        && digit(5)
+        && digit(6)
+        && bytes[7] == b'-'
+        && digit(8)
+        && digit(9))
+    {
+        return false;
+    }
+    if !matches!(bytes[10], b' ' | b'T') {
+        return false;
+    }
+    if !(digit(11)
+        && digit(12)
+        && bytes[13] == b':'
+        && digit(14)
+        && digit(15)
+        && bytes[16] == b':'
+        && digit(17)
+        && digit(18))
+    {
+        return false;
+    }
+    let num = |a: usize, b: usize| {
+        std::str::from_utf8(&bytes[a..b])
+            .ok()
+            .and_then(|text| text.parse::<i64>().ok())
+            .unwrap_or(i64::MAX)
+    };
+    let secs = civil_utc_secs(num(0, 4), num(5, 7), num(8, 10), num(11, 13), num(14, 16), num(17, 19));
+    (-25 * 3600..26 * 3600).contains(&secs)
+}
+
+/// Seconds since 1970-01-01 for a civil UTC date. Invalid months yield a
+/// value far outside the epoch window.
+fn civil_utc_secs(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> i64 {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return i64::MAX / 4;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    days * 86400 + hour * 3600 + min * 60 + sec
 }
 
 fn trim_newline(bytes: &[u8]) -> &[u8] {

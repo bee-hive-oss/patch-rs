@@ -1062,7 +1062,7 @@ fn pfatal_message(program: &str, message: &str, err: &io::Error) -> String {
 }
 
 /// GNU `pfatal` prints `strerror(errno)`. Rust appends ` (os error N)`.
-fn io_error_text(err: &io::Error) -> String {
+pub(crate) fn io_error_text(err: &io::Error) -> String {
     // EILSEQ. GNU patch special-cases this instead of using strerror.
     if err.raw_os_error() == Some(84) {
         return "Invalid byte sequence".to_string();

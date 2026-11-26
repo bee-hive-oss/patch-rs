@@ -4,7 +4,33 @@
 //! `apply_hunk`. Input lines are 1-based and keep their trailing newline
 //! when the file had one.
 
-use crate::diff::Hunk;
+use crate::diff::{DiffKind, Hunk};
+use std::cmp::Ordering;
+use std::io::{self, Write};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectStyle {
+    Unified,
+    /// `new_style` selects ` ****` / ` ----` markers. Old context and normal
+    /// diffs use a blank star marker and ` -----`.
+    Context { new_style: bool },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RejectNames<'a> {
+    pub index: Option<&'a str>,
+    pub old_name: &'a str,
+    pub new_name: &'a str,
+    pub old_time: &'a str,
+    pub new_time: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyError {
+    Misordered,
+    /// `old` and `new` are hunk-relative line indexes, as GNU reports them.
+    Mangled { old: i64, new: i64 },
+}
 
 #[derive(Clone, Debug)]
 pub struct Applied {
@@ -232,6 +258,9 @@ struct OutState {
 
 fn copy_till(out: &mut OutState, lines: &[Vec<u8>], last: i64) -> bool {
     if out.frozen > last {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(b"misordered hunks! output would be garbled\n");
+        let _ = stdout.flush();
         return false;
     }
     while out.frozen < last {
@@ -266,7 +295,7 @@ pub fn apply_hunk(
     where_line: i64,
     output: &mut Vec<u8>,
     frozen: &mut i64,
-) -> bool {
+) -> Result<(), ApplyError> {
     let mut out = OutState {
         buf: std::mem::take(output),
         after_newline: true,
@@ -289,7 +318,7 @@ pub fn apply_hunk(
             if !copy_till(&mut out, lines, where_line + old - 1) {
                 *output = out.buf;
                 *frozen = out.frozen;
-                return false;
+                return Err(ApplyError::Misordered);
             }
             out.frozen += 1;
             old += 1;
@@ -299,19 +328,19 @@ pub fn apply_hunk(
             if !copy_till(&mut out, lines, where_line + old - 1) {
                 *output = out.buf;
                 *frozen = out.frozen;
-                return false;
+                return Err(ApplyError::Misordered);
             }
             write_hunk_line(&mut out, hunk.text(new));
             new += 1;
         } else if hunk.ch(new) != hunk.ch(old) {
             *output = out.buf;
             *frozen = out.frozen;
-            return false;
+            return Err(ApplyError::Mangled { old, new });
         } else if hunk.ch(new) == b'!' {
             if !copy_till(&mut out, lines, where_line + old - 1) {
                 *output = out.buf;
                 *frozen = out.frozen;
-                return false;
+                return Err(ApplyError::Misordered);
             }
             while hunk.ch(old) == b'!' {
                 out.frozen += 1;
@@ -330,7 +359,7 @@ pub fn apply_hunk(
         if !copy_till(&mut out, lines, where_line + old - 1) {
             *output = out.buf;
             *frozen = out.frozen;
-            return false;
+            return Err(ApplyError::Misordered);
         }
         while new <= pat_end && hunk.ch(new) == b'+' {
             write_hunk_line(&mut out, hunk.text(new));
@@ -339,7 +368,7 @@ pub fn apply_hunk(
     }
     *output = out.buf;
     *frozen = out.frozen;
-    true
+    Ok(())
 }
 
 /// Copy any input lines not yet consumed.
@@ -446,6 +475,206 @@ fn push_header(out: &mut Vec<u8>, tag: &[u8], name: &str, timestr: &str) {
     out.push(b'\n');
 }
 
+/// Render one failed hunk the way GNU `abort_hunk` does.
+///
+/// `header` is true only for the first failed hunk of the file. Names are
+/// already in apply order (swapped when `-R` is in effect).
+pub fn format_reject_hunk(
+    hunk: &Hunk,
+    kind: DiffKind,
+    style: RejectStyle,
+    out_offset: i64,
+    names: &RejectNames<'_>,
+    header: bool,
+) -> Vec<u8> {
+    let mut hunk = hunk.clone();
+    match style {
+        RejectStyle::Unified => {
+            if kind != DiffKind::Unified {
+                normalize_unified(&mut hunk);
+            }
+            format_unified_reject(&hunk, out_offset, names, header)
+        }
+        RejectStyle::Context { new_style } => {
+            if kind == DiffKind::Unified {
+                normalize_context(&mut hunk);
+            }
+            format_context_reject(&hunk, new_style, out_offset, names, header)
+        }
+    }
+}
+
+fn normalize_unified(hunk: &mut Hunk) {
+    let last = hunk.ptrn_lines;
+    let end = hunk.end();
+    let mut new = last + 1;
+    while hunk.ch(new) == b'=' || hunk.ch(new) == b'\n' {
+        new += 1;
+    }
+    let mut old = 1i64;
+    while old <= last {
+        if hunk.ch(old) == b'!' {
+            hunk.lines[old as usize].ch = b'-';
+        }
+        old += 1;
+    }
+    while new <= end {
+        if hunk.ch(new) == b'!' {
+            hunk.lines[new as usize].ch = b'+';
+        }
+        new += 1;
+    }
+}
+
+fn normalize_context(hunk: &mut Hunk) {
+    let last = hunk.ptrn_lines;
+    let end = hunk.end();
+    let mut old = 1i64;
+    let mut new = last + 1;
+    while hunk.ch(new) == b'=' || hunk.ch(new) == b'\n' {
+        new += 1;
+    }
+    while old <= last {
+        if hunk.ch(old) == b'-' {
+            if new <= end && hunk.ch(new) == b'+' {
+                while old <= last && hunk.ch(old) == b'-' {
+                    hunk.lines[old as usize].ch = b'!';
+                    old += 1;
+                }
+                while new <= end && hunk.ch(new) == b'+' {
+                    hunk.lines[new as usize].ch = b'!';
+                    new += 1;
+                }
+            } else {
+                while old <= last && hunk.ch(old) == b'-' {
+                    old += 1;
+                }
+            }
+        } else if new <= end && hunk.ch(new) == b'+' {
+            while new <= end && hunk.ch(new) == b'+' {
+                new += 1;
+            }
+        } else {
+            old += 1;
+            new += 1;
+        }
+    }
+}
+
+fn format_unified_reject(
+    hunk: &Hunk,
+    out_offset: i64,
+    names: &RejectNames<'_>,
+    header: bool,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    if header {
+        if let Some(index) = names.index {
+            out.extend_from_slice(b"Index: ");
+            out.extend_from_slice(index.as_bytes());
+            out.push(b'\n');
+        }
+        push_header(&mut out, b"--- ", names.old_name, names.old_time);
+        push_header(&mut out, b"+++ ", names.new_name, names.new_time);
+    }
+    out.extend_from_slice(b"@@ -");
+    push_range(&mut out, hunk.old_first + out_offset, hunk.ptrn_lines);
+    out.extend_from_slice(b" +");
+    push_range(&mut out, hunk.new_first + out_offset, hunk.repl_lines);
+    out.extend_from_slice(b" @@");
+    out.extend_from_slice(&hunk.c_function);
+    out.push(b'\n');
+    let mut old = 1i64;
+    let lastline = hunk.ptrn_lines;
+    let mut new = lastline + 1;
+    while hunk.ch(new) == b'=' || hunk.ch(new) == b'\n' {
+        new += 1;
+    }
+    loop {
+        while hunk.ch(old) == b'-' {
+            out.push(b'-');
+            out.extend_from_slice(hunk.text(old));
+            old += 1;
+        }
+        while hunk.ch(new) == b'+' {
+            out.push(b'+');
+            out.extend_from_slice(hunk.text(new));
+            new += 1;
+        }
+        if old > lastline {
+            break;
+        }
+        out.push(b' ');
+        out.extend_from_slice(hunk.text(old));
+        old += 1;
+        new += 1;
+    }
+    out
+}
+
+fn format_context_reject(
+    hunk: &Hunk,
+    new_style: bool,
+    out_offset: i64,
+    names: &RejectNames<'_>,
+    header: bool,
+) -> Vec<u8> {
+    let (stars, minuses) = if new_style {
+        (" ****", " ----")
+    } else {
+        ("", " -----")
+    };
+    let mut out = Vec::new();
+    if header {
+        if let Some(index) = names.index {
+            out.extend_from_slice(b"Index: ");
+            out.extend_from_slice(index.as_bytes());
+            out.push(b'\n');
+        }
+        push_header(&mut out, b"*** ", names.old_name, names.old_time);
+        push_header(&mut out, b"--- ", names.new_name, names.new_time);
+    }
+    out.extend_from_slice(b"***************");
+    out.extend_from_slice(&hunk.c_function);
+    out.push(b'\n');
+    let oldfirst = hunk.old_first + out_offset;
+    let newfirst = hunk.new_first + out_offset;
+    let oldlast = oldfirst + hunk.ptrn_lines - 1;
+    let newlast = newfirst + hunk.repl_lines - 1;
+    let end = hunk.end();
+    let mut i = 0i64;
+    while i <= end {
+        match hunk.ch(i) {
+            b'*' => push_context_range(&mut out, b"*** ", oldfirst, oldlast, stars),
+            b'=' => push_context_range(&mut out, b"--- ", newfirst, newlast, minuses),
+            b' ' | b'-' | b'+' | b'!' => {
+                out.push(hunk.ch(i));
+                out.push(b' ');
+                out.extend_from_slice(hunk.text(i));
+            }
+            b'\n' => out.extend_from_slice(hunk.text(i)),
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+fn push_context_range(out: &mut Vec<u8>, tag: &[u8], first: i64, last: i64, marker: &str) {
+    out.extend_from_slice(tag);
+    match last.cmp(&first) {
+        Ordering::Less => out.extend_from_slice(b"0"),
+        Ordering::Equal => out.extend_from_slice(first.to_string().as_bytes()),
+        Ordering::Greater => {
+            out.extend_from_slice(first.to_string().as_bytes());
+            out.push(b',');
+            out.extend_from_slice(last.to_string().as_bytes());
+        }
+    }
+    out.extend_from_slice(marker.as_bytes());
+    out.push(b'\n');
+}
+
 fn push_range(out: &mut Vec<u8>, start: i64, count: i64) {
     match count {
         0 => {
@@ -477,7 +706,7 @@ mod tests {
         assert_eq!(offset, 0);
         let mut output = Vec::new();
         let mut frozen = 0i64;
-        assert!(apply_hunk(hunk, &lines, 1, &mut output, &mut frozen));
+        assert!(apply_hunk(hunk, &lines, 1, &mut output, &mut frozen).is_ok());
         spew_rest(&lines, &mut output, &mut frozen);
         assert_eq!(output, b"new\n");
     }
