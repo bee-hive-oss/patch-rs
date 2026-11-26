@@ -1332,7 +1332,10 @@ fn parse_context_hunk(
     }
     let mut ptrn_lines = ptrn_lines;
     let mut old_first = old_first;
-    if !some_context && fillcnt == 1 {
+    // GNU's null-hunk rewrite is the else of an omitted replacement. An
+    // omitted one-line replacement is still filled, then rejected when the
+    // pattern has no context line to copy.
+    if !repl_missing && !some_context && fillcnt == 1 {
         old_first += 1;
         ptrn_lines = 0;
         fillcnt = 0;
