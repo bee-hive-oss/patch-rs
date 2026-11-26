@@ -389,7 +389,7 @@ fn parse_one(
             }
             // `+++` is stored first and swapped when `@@` is seen, matching
             // GNU. A `---` line is the name that becomes the old name.
-            let (name, timestr, stamp) = fetch_name_stamp(trimmed[4..].as_bytes());
+            let (name, timestr, stamp) = fetch_name_stamp(&trimmed.as_bytes()[4..]);
             new_name = name;
             new_timestr = timestr;
             new_stamp = stamp;
@@ -400,7 +400,7 @@ fn parse_one(
             continue;
         }
         if is_plus_header(trimmed.as_bytes()) {
-            let (name, timestr, stamp) = fetch_name_stamp(trimmed[4..].as_bytes());
+            let (name, timestr, stamp) = fetch_name_stamp(&trimmed.as_bytes()[4..]);
             old_name = name;
             old_timestr = timestr;
             old_stamp = stamp;
@@ -411,7 +411,7 @@ fn parse_one(
             continue;
         }
         if is_star_header(trimmed.as_bytes()) {
-            let (name, timestr, stamp) = fetch_name_stamp(trimmed[4..].as_bytes());
+            let (name, timestr, stamp) = fetch_name_stamp(&trimmed.as_bytes()[4..]);
             old_name = name;
             old_timestr = timestr;
             old_stamp = stamp;
@@ -438,18 +438,19 @@ fn parse_one(
             );
             break;
         }
-        if is_star_separator(&trimmed) && !need_header {
-            if let Some(next) = lines.get(index + 1) {
-                let (next_indent, _) = line_indent(&next.raw);
-                let next_trim = trim_indent(&line_str(next));
-                if next_indent == line_indent(line.raw.as_slice()).0
-                    && looks_like_context_range(next_trim.as_bytes())
-                {
-                    // The range line, not the `---` header, decides for context.
-                    strip_cr = line_has_cr(next);
-                    kind = Some(DiffKind::Context);
-                    break;
-                }
+        if is_star_separator(&trimmed)
+            && !need_header
+            && let Some(next) = lines.get(index + 1)
+        {
+            let (next_indent, _) = line_indent(&next.raw);
+            let next_trim = trim_indent(&line_str(next));
+            if next_indent == line_indent(line.raw.as_slice()).0
+                && looks_like_context_range(next_trim.as_bytes())
+            {
+                // The range line, not the `---` header, decides for context.
+                strip_cr = line_has_cr(next);
+                kind = Some(DiffKind::Context);
+                break;
             }
         }
         if !need_header && is_normal_command(trimmed.as_bytes()) {
@@ -853,10 +854,10 @@ fn parse_unified_hunk(lines: &[SrcLine], start: usize) -> Result<(Hunk, usize), 
         index += 1;
         if raw.first() == Some(&b'\\') {
             // "\ No newline..." applies to the previous body line.
-            if let Some(last) = body.last_mut() {
-                if last.1.last() == Some(&b'\n') {
-                    last.1.pop();
-                }
+            if let Some(last) = body.last_mut()
+                && last.1.last() == Some(&b'\n')
+            {
+                last.1.pop();
             }
             continue;
         }
@@ -1873,10 +1874,11 @@ fn fetch_name_stamp(bytes: &[u8]) -> (Option<String>, String, i64) {
         end += 1;
     }
     // A tab starts the timestamp. Internal spaces are kept when a tab follows.
-    if end < bytes.len() && bytes[end] != b'\t' {
-        if let Some(tab) = bytes.iter().position(|&b| b == b'\t') {
-            end = tab;
-        }
+    if end < bytes.len()
+        && bytes[end] != b'\t'
+        && let Some(tab) = bytes.iter().position(|&b| b == b'\t')
+    {
+        end = tab;
     }
     let name = String::from_utf8_lossy(&bytes[..end]).into_owned();
     let timestr = String::from_utf8_lossy(trim_newline(&bytes[end..])).into_owned();

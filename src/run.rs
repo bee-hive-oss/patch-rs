@@ -141,16 +141,16 @@ impl<'a> Engine<'a> {
     }
 
     fn execute(&mut self) -> Result<i32, String> {
-        if let Some(path) = &self.opt.output {
-            if path != "-" {
-                self.outfile = Some(self.open_output(Path::new(path))?);
-            }
+        if let Some(path) = &self.opt.output
+            && path != "-"
+        {
+            self.outfile = Some(self.open_output(Path::new(path))?);
         }
         let input = self.read_patch()?;
-        if !self.opt.binary {
-            if let Some(line) = first_nul_line(&input) {
-                return Err(format!("patch line {line} contains NUL byte"));
-            }
+        if !self.opt.binary
+            && let Some(line) = first_nul_line(&input)
+        {
+            return Err(format!("patch line {line} contains NUL byte"));
         }
         let need_header = self.opt.original.is_none() && !self.opt.posix;
         let force_normal = self.opt.forced_diff == ForcedDiff::Normal;
@@ -184,25 +184,25 @@ impl<'a> Engine<'a> {
 
     fn no_files(&mut self, input: &[u8]) -> Result<i32, String> {
         if input.is_empty() {
-            if let Some(from) = &self.opt.original {
-                if let Some(to) = &self.opt.output {
-                    if to != "-" && !self.opt.dry_run {
-                        if self.opt.verbosity != Verbosity::Silent {
-                            self.say(&format!(
-                                "patching file {} (read from {})\n",
-                                self.opt.quote(to),
-                                self.opt.quote(from)
-                            ));
-                        }
-                        let data = fs::read(from).unwrap_or_default();
-                        self.write_output_bytes(Path::new(to), &data, None)?;
-                    } else if self.opt.verbosity != Verbosity::Silent {
+            if let Some(from) = &self.opt.original
+                && let Some(to) = &self.opt.output
+            {
+                if to != "-" && !self.opt.dry_run {
+                    if self.opt.verbosity != Verbosity::Silent {
                         self.say(&format!(
                             "patching file {} (read from {})\n",
                             self.opt.quote(to),
                             self.opt.quote(from)
                         ));
                     }
+                    let data = fs::read(from).unwrap_or_default();
+                    self.write_output_bytes(Path::new(to), &data, None)?;
+                } else if self.opt.verbosity != Verbosity::Silent {
+                    self.say(&format!(
+                        "patching file {} (read from {})\n",
+                        self.opt.quote(to),
+                        self.opt.quote(from)
+                    ));
                 }
             }
             return Ok(0);
@@ -220,10 +220,11 @@ impl<'a> Engine<'a> {
         }
         // Context hunks are parsed while GNU is still choosing a file name.
         // A mangled first hunk dies before "patching file".
-        if file.hunks.is_empty() && matches!(file.kind, DiffKind::Context | DiffKind::NewContext) {
-            if let Some(error) = &file.parse_error {
-                return Err(error.clone());
-            }
+        if file.hunks.is_empty()
+            && matches!(file.kind, DiffKind::Context | DiffKind::NewContext)
+            && let Some(error) = &file.parse_error
+        {
+            return Err(error.clone());
         }
         let names = self.strip_names(file);
         let patch_type = patch_file_type(file);
@@ -247,10 +248,12 @@ impl<'a> Engine<'a> {
             self.somefailed = true;
         }
         let outname = self.out_name(file, &names, &pick, reverse);
-        if file.git && !pick.skip && self.opt.output.is_none() {
-            if let Some(out) = &outname {
-                self.note_git_output_target(out)?;
-            }
+        if file.git
+            && !pick.skip
+            && self.opt.output.is_none()
+            && let Some(out) = &outname
+        {
+            self.note_git_output_target(out)?;
         }
         if !pick.skip && file.kind == DiffKind::GitBinary {
             if let Some(name) = &outname {
@@ -263,13 +266,13 @@ impl<'a> Engine<'a> {
             self.somefailed = true;
         }
         let mut info = InputInfo::missing();
-        if !pick.skip {
-            if let Some(name) = &pick.name {
-                info = self.load_input(name, patch_type)?;
-                if info.refused {
-                    pick.skip = true;
-                    self.somefailed = true;
-                }
+        if !pick.skip
+            && let Some(name) = &pick.name
+        {
+            info = self.load_input(name, patch_type)?;
+            if info.refused {
+                pick.skip = true;
+                self.somefailed = true;
             }
         }
         if self.read_only_blocked(&pick, &info) {
@@ -282,10 +285,10 @@ impl<'a> Engine<'a> {
         if file.kind != DiffKind::Ed && !pick.skip && self.opt.verbosity != Verbosity::Silent {
             self.say_patching(file, &names, &pick, &outname, patch_type);
         }
-        if file.hunks.is_empty() {
-            if let Some(error) = &file.parse_error {
-                return Err(error.clone());
-            }
+        if file.hunks.is_empty()
+            && let Some(error) = &file.parse_error
+        {
+            return Err(error.clone());
         }
         if file.kind == DiffKind::Ed {
             self.apply_ed(file, &pick, &outname, &info)?;
@@ -410,10 +413,10 @@ impl<'a> Engine<'a> {
         pick: &Pick,
         reverse: bool,
     ) -> Option<String> {
-        if let Some(path) = &self.opt.output {
-            if !pick.skip {
-                return Some(path.clone());
-            }
+        if let Some(path) = &self.opt.output
+            && !pick.skip
+        {
+            return Some(path.clone());
         }
         if pick.skip {
             return None;
@@ -602,12 +605,12 @@ impl Engine<'_> {
             let Some(name) = slots[i].as_deref() else {
                 continue;
             };
-            if let Some(prev) = i0 {
-                if slots[prev].as_deref() == Some(name) {
-                    stats[i] = stats[prev];
-                    i0 = Some(i);
-                    continue;
-                }
+            if let Some(prev) = i0
+                && slots[prev].as_deref() == Some(name)
+            {
+                stats[i] = stats[prev];
+                i0 = Some(i);
+                continue;
             }
             stats[i] = self.conceal_deleted(inspect(name, self.opt.follow_symlinks));
             if stats[i].ok && self.opt.posix && self.name_is_valid(name, &mut warned) {
@@ -914,14 +917,14 @@ impl Engine<'_> {
 
     fn ask(&mut self, prompt: &str) -> String {
         self.say(prompt);
-        if self.opt.posix || io::stdout().is_terminal() {
-            if let Ok(mut tty) = File::open("/dev/tty") {
-                let mut buf = [0u8; 256];
-                if let Ok(n) = tty.read(&mut buf) {
-                    if n > 0 {
-                        return String::from_utf8_lossy(&buf[..n]).into_owned();
-                    }
-                }
+        if (self.opt.posix || io::stdout().is_terminal())
+            && let Ok(mut tty) = File::open("/dev/tty")
+        {
+            let mut buf = [0u8; 256];
+            if let Ok(n) = tty.read(&mut buf)
+                && n > 0
+            {
+                return String::from_utf8_lossy(&buf[..n]).into_owned();
             }
         }
         self.say("\n");
@@ -1229,12 +1232,11 @@ impl Engine<'_> {
                 .map_err(|err| format!("write error : {}", cli::io_error_text(&err)))?;
             self.note_replaced(out, previous);
         }
-        if file.rename {
-            if let Some(src) = &pick.name {
-                if src != out {
-                    self.queue_delete(src, backup)?;
-                }
-            }
+        if file.rename
+            && let Some(src) = &pick.name
+            && src != out
+        {
+            self.queue_delete(src, backup)?;
         }
         Ok(())
     }
@@ -1242,15 +1244,15 @@ impl Engine<'_> {
     /// If this output inode already has a queued replacement, write queued
     /// files first. Then remember the inode so the next patch can do the same.
     fn note_git_output_target(&mut self, out: &str) -> Result<(), String> {
-        if let Some((dev, ino)) = file_ids(out, self.opt.follow_symlinks) {
-            if self.queued_inodes.iter().any(|id| *id == (dev, ino)) {
-                self.flush_queued_outputs()?;
-            }
+        if let Some((dev, ino)) = file_ids(out, self.opt.follow_symlinks)
+            && self.queued_inodes.contains(&(dev, ino))
+        {
+            self.flush_queued_outputs()?;
         }
-        if let Some((dev, ino)) = file_ids(out, self.opt.follow_symlinks) {
-            if !self.queued_inodes.iter().any(|id| *id == (dev, ino)) {
-                self.queued_inodes.push((dev, ino));
-            }
+        if let Some((dev, ino)) = file_ids(out, self.opt.follow_symlinks)
+            && !self.queued_inodes.contains(&(dev, ino))
+        {
+            self.queued_inodes.push((dev, ino));
         }
         Ok(())
     }
@@ -1440,14 +1442,14 @@ impl Engine<'_> {
             let previous = file_ids(&item.name, self.opt.follow_symlinks);
             if item.backup {
                 self.create_backup(&item.name, previous.is_some(), false)?;
-            } else if let Err(err) = fs::remove_file(&item.name) {
-                if err.kind() != io::ErrorKind::NotFound {
-                    return Err(format!(
-                        "Can't remove file {} : {}",
-                        self.opt.quote(&item.name),
-                        cli::io_error_text(&err)
-                    ));
-                }
+            } else if let Err(err) = fs::remove_file(&item.name)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                return Err(format!(
+                    "Can't remove file {} : {}",
+                    self.opt.quote(&item.name),
+                    cli::io_error_text(&err)
+                ));
             }
             if let Some((dev, ino)) = previous {
                 self.remember(dev, ino, IdKind::Overwritten);
@@ -1549,10 +1551,10 @@ impl Engine<'_> {
     }
 
     fn reject_path(&self, outname: &str) -> String {
-        if let Some(path) = &self.opt.reject_file {
-            if path != "-" {
-                return path.clone();
-            }
+        if let Some(path) = &self.opt.reject_file
+            && path != "-"
+        {
+            return path.clone();
         }
         let mut rej = format!("{outname}.rej");
         if rej.ends_with('~') {
@@ -1657,10 +1659,11 @@ impl Engine<'_> {
     }
 
     fn place(&mut self, path: &Path, data: &[u8], mode: Option<u32>) -> Result<(), io::Error> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent)?;
         }
         self.tmp_seq += 1;
         let tmp_name = format!(".patch-rs-{}-{}", std::process::id(), self.tmp_seq);
@@ -1726,16 +1729,18 @@ impl Engine<'_> {
                 self.opt.quote(&path.display().to_string())
             ));
         }
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() && !self.opt.dry_run {
-                fs::create_dir_all(parent).map_err(|err| {
-                    format!(
-                        "Can't create file {} : {}",
-                        self.opt.quote(&path.display().to_string()),
-                        cli::io_error_text(&err)
-                    )
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+            && !self.opt.dry_run
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "Can't create file {} : {}",
+                    self.opt.quote(&path.display().to_string()),
+                    cli::io_error_text(&err)
+                )
+            })?;
         }
         OpenOptions::new()
             .write(true)
