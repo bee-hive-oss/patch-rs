@@ -631,25 +631,31 @@ impl Engine<'_> {
                 Some(i) => stats[i].kind == patch_type,
                 None => true,
             };
-            // GNU patch 2.8.1 checks this name before maybe_reverse. A reversed
-            // delete of a missing file would create it (CVE-2026-115207).
+            // A reversed delete of a missing file would create it
+            // (CVE-2026-115207). Reject that name before maybe_reverse, and
+            // only when the reversal would adopt it. An ordinary edit whose
+            // other name is `..` or absolute stays on the best_name path
+            // (GNU bad-filenames, `--- f` / `+++ ../g`).
             if let Some(fallback) = i0
-                && let Some(fallback_name) = slots[fallback].as_deref()
-                && self.name_is_valid(fallback_name, &mut warned)
                 && (chosen.is_none() || type_ok)
             {
-                let idx = chosen.or(i0).unwrap();
+                let idx = chosen.unwrap_or(fallback);
                 let name = slots[idx].as_deref().unwrap_or("");
                 let nonexistent = chosen.is_none();
                 let is_empty = nonexistent || stats[idx].len == 0;
-                let answer = self.maybe_reverse(file, name, nonexistent, is_empty, *reverse);
-                *reverse = answer.reverse;
-                if answer.looks && chosen.is_none() {
-                    chosen = i0;
-                }
-                if answer.skip {
-                    let pick = self.pick_from(chosen, &slots);
-                    return Pick { skip: true, ..pick };
+                let dangerous_create = nonexistent
+                    && reversal_looks(file, nonexistent, is_empty, *reverse)
+                    && !self.name_is_valid(name, &mut warned);
+                if !dangerous_create {
+                    let answer = self.maybe_reverse(file, name, nonexistent, is_empty, *reverse);
+                    *reverse = answer.reverse;
+                    if answer.looks && chosen.is_none() {
+                        chosen = Some(fallback);
+                    }
+                    if answer.skip {
+                        let pick = self.pick_from(chosen, &slots);
+                        return Pick { skip: true, ..pick };
+                    }
                 }
             }
             if chosen.is_none() && says(file, *reverse) != 0 {
@@ -837,17 +843,7 @@ impl Engine<'_> {
         is_empty: bool,
         reverse: bool,
     ) -> ReverseAnswer {
-        let left = says(file, reverse ^ nonexistent);
-        let right = says(file, !reverse ^ nonexistent);
-        if is_empty && left == 1 && right == 2 {
-            return ReverseAnswer {
-                looks: false,
-                reverse,
-                skip: false,
-            };
-        }
-        let looks = u8::from(!is_empty) < says(file, reverse ^ is_empty);
-        if !looks {
+        if !reversal_looks(file, nonexistent, is_empty, reverse) {
             return ReverseAnswer {
                 looks: false,
                 reverse,
@@ -1854,6 +1850,17 @@ fn says(file: &FilePatch, which_new: bool) -> u8 {
     }
 }
 
+/// Whether `maybe_reverse` would treat this patch as reversed.
+/// A diff --git index that marks one side empty is not a reversal.
+fn reversal_looks(file: &FilePatch, nonexistent: bool, is_empty: bool, reverse: bool) -> bool {
+    let left = says(file, reverse ^ nonexistent);
+    let right = says(file, !reverse ^ nonexistent);
+    if is_empty && left == 1 && right == 2 {
+        return false;
+    }
+    u8::from(!is_empty) < says(file, reverse ^ is_empty)
+}
+
 fn side_name(names: &Names, which_new: bool) -> Option<String> {
     if which_new {
         names.new.clone()
@@ -2329,5 +2336,21 @@ No file to patch.  Skipping patch.
         assert!(!root.join("dotout").exists());
         assert!(output.starts_with("Ignoring potentially dangerous file name ../dotout\n"));
         assert!(!output.contains("patching file"));
+
+        // GNU bad-filenames: `+++ ../g` on a normal edit is not a create.
+        let edit = root.join("edit.diff");
+        fs::write(&edit, "--- f\n+++ ../g\n@@ -1 +1 @@\n-1\n+1\n").unwrap();
+        let (status, output) = apply_in_dir(&edit, &["-f", "-p0", "--dry-run"]);
+        assert_eq!(status, 1, "{output}");
+        assert!(!output.contains("dangerous"), "{output}");
+        assert!(output.contains("can't find file to patch"));
+        assert!(!root.join("g").exists());
+
+        fs::write(work.join("f"), "1\n").unwrap();
+        let (status, output) = apply_in_dir(&edit, &["-f", "-p0", "--dry-run"]);
+        assert_eq!(status, 0, "{output}");
+        assert_eq!(output, "checking file f\n");
+        assert_eq!(fs::read(work.join("f")).unwrap(), b"1\n");
+        assert!(!root.join("g").exists());
     }
 }
