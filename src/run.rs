@@ -1,14 +1,17 @@
-//! Apply parsed diffs and write reject files.
+//! Apply parsed diffs, write reject files, and back up originals.
 //!
 //! Messages, exit codes, and the files left behind follow GNU patch 2.8.
-//! Backup files are filled in by a later commit.
+//! A backup is made for `-b`, or by default when a hunk mismatches or fails.
+//! The same inode is backed up only before this run replaces it. Deletes wait
+//! until every file has been applied, so a later create still sees the
+//! original backup.
 
 use crate::apply::{self, format_reject_hunk, ApplyError, RejectNames, RejectStyle};
-use crate::cli::{self, ForcedDiff, Options, ReadOnly, RejectFormat, Verbosity, EXIT_FAILURE};
+use crate::cli::{self, BackupType, ForcedDiff, Options, ReadOnly, RejectFormat, Verbosity, EXIT_FAILURE};
 use crate::diff::{self, strip_name, DiffKind, FilePatch, Hunk};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -26,6 +29,9 @@ struct Engine<'a> {
     at_root: bool,
     outfile: Option<File>,
     seen_file: bool,
+    /// Inodes this run has created, overwritten, or scheduled for deletion.
+    files: Vec<FileRec>,
+    pending_deletes: Vec<PendingDelete>,
 }
 
 struct Names {
@@ -57,6 +63,29 @@ struct Applied {
     skip: bool,
     reverse: bool,
     reject: Vec<u8>,
+    /// True when any locate needed fuzz, an offset, or failed to match.
+    mismatch: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdKind {
+    Created,
+    DeleteLater,
+    Overwritten,
+}
+
+struct FileRec {
+    dev: u64,
+    ino: u64,
+    kind: IdKind,
+}
+
+struct PendingDelete {
+    name: String,
+    dev: u64,
+    ino: u64,
+    kind: u32,
+    backup: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -64,6 +93,8 @@ struct StatBuf {
     ok: bool,
     len: u64,
     kind: u32,
+    dev: u64,
+    ino: u64,
 }
 
 pub fn run(opt: &Options) -> i32 {
@@ -87,6 +118,8 @@ impl<'a> Engine<'a> {
             at_root: cwd_is_root(),
             outfile: None,
             seen_file: false,
+            files: Vec::new(),
+            pending_deletes: Vec::new(),
         }
     }
 
@@ -115,6 +148,7 @@ impl<'a> Engine<'a> {
         if self.opt.verbosity == Verbosity::Verbose {
             self.say("done\n");
         }
+        self.flush_deletes()?;
         if self.somefailed {
             Ok(EXIT_FAILURE)
         } else {
@@ -420,6 +454,9 @@ impl<'a> Engine<'a> {
             Ok(meta) => meta,
             Err(_) => return Ok(InputInfo::missing()),
         };
+        if self.lookup(meta.dev(), meta.ino()) == Some(IdKind::DeleteLater) {
+            return Ok(InputInfo::missing());
+        }
         let kind = meta_kind(&meta);
         let type_ok = (patch_type == S_IFREG || patch_type == S_IFLNK) && kind == patch_type;
         if !type_ok {
@@ -544,7 +581,7 @@ impl Engine<'_> {
                     continue;
                 }
             }
-            stats[i] = inspect(name, self.opt.follow_symlinks);
+            stats[i] = self.conceal_deleted(inspect(name, self.opt.follow_symlinks));
             if stats[i].ok && self.opt.posix && self.name_is_valid(name, &mut warned) {
                 chosen = Some(i);
                 i0 = Some(i);
@@ -600,7 +637,7 @@ impl Engine<'_> {
         patch_type: u32,
         reverse: &mut bool,
     ) -> Pick {
-        let stat = inspect(name, self.opt.follow_symlinks);
+        let stat = self.conceal_deleted(inspect(name, self.opt.follow_symlinks));
         if !stat.ok || stat.kind == patch_type {
             let answer = self.maybe_reverse(file, name, !stat.ok, !stat.ok || stat.len == 0, *reverse);
             *reverse = answer.reverse;
@@ -887,6 +924,7 @@ impl Engine<'_> {
         let mut in_offset = 0i64;
         let mut out_offset = 0i64;
         let mut failed = 0i64;
+        let mut mismatch = false;
         let mut header = true;
         let mut reject = Vec::new();
         let mut apply_anyway = false;
@@ -907,6 +945,7 @@ impl Engine<'_> {
                     cli_reverse,
                     apply_anyway: &mut apply_anyway,
                     skip: &mut skip,
+                    mismatch: &mut mismatch,
                 };
                 let located = self.locate_with_fuzz(index, &mut cursor);
                 where_line = located.where_line;
@@ -976,6 +1015,7 @@ impl Engine<'_> {
             skip,
             reverse,
             reject,
+            mismatch,
         })
     }
 
@@ -999,6 +1039,9 @@ impl Engine<'_> {
             );
             if found.is_some() {
                 *cursor.in_offset = trial;
+            }
+            if found.is_none() || fuzz != 0 || *cursor.in_offset != 0 {
+                *cursor.mismatch = true;
             }
             let mut where_line = found;
             if index == 0
@@ -1101,9 +1144,10 @@ impl Engine<'_> {
         let zero = applied.output.is_empty();
         let delete = zero
             && (self.opt.remove_empty || (!self.opt.posix && says_new == 2) || info.kind == S_IFLNK);
+        let backup = self.wants_backup(applied);
         if delete {
             if !self.opt.dry_run && info.exists {
-                let _ = fs::remove_file(out);
+                self.queue_delete(out, backup)?;
             }
             return Ok(());
         }
@@ -1120,7 +1164,13 @@ impl Engine<'_> {
         let new_mode = side_mode(file, !applied.reverse);
         let set_mode = new_mode != 0 && old_mode != new_mode;
         let replace = applied.failed < applied.hunk_count || set_mode || file.copy || file.rename;
-        if !replace || self.opt.dry_run {
+        if self.opt.dry_run {
+            return Ok(());
+        }
+        if !replace {
+            if backup {
+                self.backup_unmodified(out)?;
+            }
             return Ok(());
         }
         let mode = if info.exists || set_mode {
@@ -1132,17 +1182,235 @@ impl Engine<'_> {
         } else {
             None
         };
+        let previous = file_ids(out, self.opt.follow_symlinks);
+        if backup {
+            self.create_backup(out, previous.is_some(), false)?;
+        }
         self.reject_newline_name(Path::new(out))?;
         self.place(Path::new(out), &applied.output, mode)
             .map_err(|err| format!("write error : {}", cli::io_error_text(&err)))?;
+        self.note_replaced(out, previous);
         if file.rename {
             if let Some(src) = &pick.name {
                 if src != out {
-                    let _ = fs::remove_file(src);
+                    self.queue_delete(src, backup)?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn wants_backup(&self, applied: &Applied) -> bool {
+        self.opt.backup || (self.opt.backup_if_mismatch && (applied.mismatch || applied.failed > 0))
+    }
+
+    /// Copy a backup and leave the original inode alone. Used when no hunk applied.
+    fn backup_unmodified(&mut self, path: &str) -> Result<(), String> {
+        if file_ids(path, self.opt.follow_symlinks).is_none() {
+            self.say(&format!("Cannot stat file {path}, skipping backup\n"));
+            return Ok(());
+        }
+        self.create_backup(path, true, true)
+    }
+
+    fn create_backup(&mut self, path: &str, exists: bool, leave_original: bool) -> Result<(), String> {
+        if exists {
+            let meta = match metadata_of(path, self.opt.follow_symlinks) {
+                Ok(meta) => meta,
+                Err(_) => {
+                    self.say(&format!("Cannot stat file {path}, skipping backup\n"));
+                    return Ok(());
+                }
+            };
+            if self.lookup(meta.dev(), meta.ino()) == Some(IdKind::Created) {
+                return Ok(());
+            }
+            let kind = meta_kind(&meta);
+            if kind != S_IFREG && kind != S_IFLNK {
+                let quoted = self.opt.quote(path);
+                return Err(format!(
+                    "File {quoted} is not a regular file -- refusing to create backup"
+                ));
+            }
+        }
+        let bak = self.backup_name(path);
+        let dest = Path::new(&bak);
+        if !exists {
+            return self.create_empty_backup(dest);
+        }
+        let source = Path::new(path);
+        if leave_original {
+            self.copy_backup(source, dest)
+        } else {
+            self.rename_backup(source, dest)
+        }
+    }
+
+    fn backup_name(&self, path: &str) -> String {
+        let prefix = self.opt.backup_prefix.as_deref();
+        let base_prefix = self.opt.backup_basename_prefix.as_deref();
+        let suffix = self.opt.backup_suffix.as_deref();
+        if prefix.is_some() || base_prefix.is_some() || suffix.is_some() {
+            return manual_backup_name(path, prefix, base_prefix, suffix);
+        }
+        // GNU's `none` still reaches the numbered-name search.
+        let kind = match self.opt.backup_type {
+            BackupType::Simple => BackupType::Simple,
+            BackupType::Existing => BackupType::Existing,
+            BackupType::Numbered | BackupType::None => BackupType::Numbered,
+        };
+        versioned_backup_name(path, kind, &self.opt.simple_backup_suffix)
+    }
+
+    fn create_empty_backup(&mut self, dest: &Path) -> Result<(), String> {
+        let _ = fs::remove_file(dest);
+        self.ensure_backup_dir(dest)?;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o666)
+            .open(dest)
+            .map(|_| ())
+            .map_err(|err| {
+                format!(
+                    "Can't create file {} : {}",
+                    self.opt.quote(&dest.display().to_string()),
+                    cli::io_error_text(&err)
+                )
+            })
+    }
+
+    fn copy_backup(&mut self, source: &Path, dest: &Path) -> Result<(), String> {
+        self.ensure_backup_dir(dest)?;
+        fs::copy(source, dest).map(|_| ()).map_err(|err| {
+            format!(
+                "Can't create file {} : {}",
+                self.opt.quote(&dest.display().to_string()),
+                cli::io_error_text(&err)
+            )
+        })
+    }
+
+    fn rename_backup(&mut self, source: &Path, dest: &Path) -> Result<(), String> {
+        self.ensure_backup_dir(dest)?;
+        match fs::rename(source, dest) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
+                self.copy_backup(source, dest)?;
+                fs::remove_file(source).map_err(|err| {
+                    format!(
+                        "Can't remove file {} : {}",
+                        self.opt.quote(&source.display().to_string()),
+                        cli::io_error_text(&err)
+                    )
+                })
+            }
+            Err(err) => Err(format!(
+                "Can't rename file {} to {} : {}",
+                self.opt.quote(&source.display().to_string()),
+                self.opt.quote(&dest.display().to_string()),
+                cli::io_error_text(&err)
+            )),
+        }
+    }
+
+    fn ensure_backup_dir(&self, dest: &Path) -> Result<(), String> {
+        let Some(parent) = dest.parent() else {
+            return Ok(());
+        };
+        if parent.as_os_str().is_empty() || parent.exists() {
+            return Ok(());
+        }
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "Can't create file {} : {}",
+                self.opt.quote(&dest.display().to_string()),
+                cli::io_error_text(&err)
+            )
+        })
+    }
+
+    fn queue_delete(&mut self, name: &str, backup: bool) -> Result<(), String> {
+        let meta = match metadata_of(name, self.opt.follow_symlinks) {
+            Ok(meta) => meta,
+            Err(_) => return Ok(()),
+        };
+        let dev = meta.dev();
+        let ino = meta.ino();
+        self.remember(dev, ino, IdKind::DeleteLater);
+        self.pending_deletes.push(PendingDelete {
+            name: name.to_string(),
+            dev,
+            ino,
+            kind: meta_kind(&meta),
+            backup,
+        });
+        Ok(())
+    }
+
+    fn flush_deletes(&mut self) -> Result<(), String> {
+        let pending = std::mem::take(&mut self.pending_deletes);
+        for item in pending {
+            if self.lookup(item.dev, item.ino) != Some(IdKind::DeleteLater) {
+                continue;
+            }
+            if self.opt.verbosity == Verbosity::Verbose {
+                let what = if item.kind == S_IFLNK {
+                    "symbolic link"
+                } else {
+                    "file"
+                };
+                self.say(&format!("Removing {what} {}\n", self.opt.quote(&item.name)));
+            }
+            let previous = file_ids(&item.name, self.opt.follow_symlinks);
+            if item.backup {
+                self.create_backup(&item.name, previous.is_some(), false)?;
+            } else if let Err(err) = fs::remove_file(&item.name) {
+                if err.kind() != io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "Can't remove file {} : {}",
+                        self.opt.quote(&item.name),
+                        cli::io_error_text(&err)
+                    ));
+                }
+            }
+            if let Some((dev, ino)) = previous {
+                self.remember(dev, ino, IdKind::Overwritten);
+            }
+        }
+        Ok(())
+    }
+
+    fn note_replaced(&mut self, path: &str, previous: Option<(u64, u64)>) {
+        if let Some((dev, ino)) = previous {
+            self.remember(dev, ino, IdKind::Overwritten);
+        }
+        if let Some((dev, ino)) = file_ids(path, self.opt.follow_symlinks) {
+            self.remember(dev, ino, IdKind::Created);
+        }
+    }
+
+    fn conceal_deleted(&self, mut stat: StatBuf) -> StatBuf {
+        if stat.ok && self.lookup(stat.dev, stat.ino) == Some(IdKind::DeleteLater) {
+            stat.ok = false;
+            stat.len = 0;
+        }
+        stat
+    }
+
+    fn lookup(&self, dev: u64, ino: u64) -> Option<IdKind> {
+        self.files
+            .iter()
+            .find(|rec| rec.dev == dev && rec.ino == ino)
+            .map(|rec| rec.kind)
+    }
+
+    fn remember(&mut self, dev: u64, ino: u64, kind: IdKind) {
+        if let Some(rec) = self.files.iter_mut().find(|rec| rec.dev == dev && rec.ino == ino) {
+            rec.kind = kind;
+            return;
+        }
+        self.files.push(FileRec { dev, ino, kind });
     }
 
     fn report_failure(
@@ -1427,6 +1695,7 @@ struct LocateCursor<'a> {
     cli_reverse: bool,
     apply_anyway: &'a mut bool,
     skip: &'a mut bool,
+    mismatch: &'a mut bool,
 }
 
 fn reject_style(opt: &Options, kind: DiffKind) -> RejectStyle {
@@ -1531,6 +1800,8 @@ fn inspect(path: &str, follow: bool) -> StatBuf {
             ok: true,
             len: meta.len(),
             kind: meta_kind(&meta),
+            dev: meta.dev(),
+            ino: meta.ino(),
         },
         Err(_) => StatBuf::missing(),
     }
@@ -1542,6 +1813,8 @@ impl StatBuf {
             ok: false,
             len: 0,
             kind: S_IFREG,
+            dev: 0,
+            ino: 0,
         }
     }
 }
@@ -1617,6 +1890,110 @@ fn first_nul_line(input: &[u8]) -> Option<i64> {
         }
     }
     None
+}
+
+fn metadata_of(path: &str, follow: bool) -> io::Result<fs::Metadata> {
+    if follow {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    }
+}
+
+fn file_ids(path: &str, follow: bool) -> Option<(u64, u64)> {
+    metadata_of(path, follow)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+fn manual_backup_name(
+    path: &str,
+    prefix: Option<&str>,
+    base_prefix: Option<&str>,
+    suffix: Option<&str>,
+) -> String {
+    let (dir, base) = split_dir_base(path);
+    format!(
+        "{}{dir}{}{base}{}",
+        prefix.unwrap_or(""),
+        base_prefix.unwrap_or(""),
+        suffix.unwrap_or("")
+    )
+}
+
+/// `simple` appends the suffix. `existing` does that too unless `base.~N~`
+/// is already present. `numbered` always uses the next `base.~N~`.
+fn versioned_backup_name(path: &str, kind: BackupType, simple_suffix: &str) -> String {
+    let (dir, base) = split_dir_base(path);
+    if kind == BackupType::Simple {
+        return format!("{path}{simple_suffix}");
+    }
+    let numbered = next_numbered_name(dir, base);
+    if kind == BackupType::Existing && numbered.is_none() {
+        format!("{path}{simple_suffix}")
+    } else {
+        let name = numbered.unwrap_or_else(|| format!("{base}.~1~"));
+        format!("{dir}{name}")
+    }
+}
+
+fn split_dir_base(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(index) => (&path[..=index], &path[index + 1..]),
+        None => ("", path),
+    }
+}
+
+/// The highest `base.~N~` in `dir`, incremented. `None` when no numbered backup exists.
+fn next_numbered_name(dir: &str, base: &str) -> Option<String> {
+    let folder = if dir.is_empty() { "." } else { dir.trim_end_matches('/') };
+    let entries = fs::read_dir(folder).ok()?;
+    let mut best: Option<String> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(version) = numbered_version(base, &name) else {
+            continue;
+        };
+        best = Some(match best {
+            Some(prev) if version_less(&version, &prev) => prev,
+            _ => version,
+        });
+    }
+    best.map(|version| format!("{base}.~{}~", increment_digits(&version)))
+}
+
+fn numbered_version(base: &str, name: &str) -> Option<String> {
+    let rest = name.strip_prefix(base)?;
+    let rest = rest.strip_prefix(".~")?;
+    let digits = rest.strip_suffix('~')?;
+    let bytes = digits.as_bytes();
+    if bytes.is_empty() || bytes[0] < b'1' || bytes[0] > b'9' {
+        return None;
+    }
+    if !bytes.iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(digits.to_string())
+}
+
+fn version_less(left: &str, right: &str) -> bool {
+    left.len() < right.len() || (left.len() == right.len() && left < right)
+}
+
+fn increment_digits(digits: &str) -> String {
+    let mut bytes = digits.as_bytes().to_vec();
+    let mut index = bytes.len();
+    while index > 0 {
+        index -= 1;
+        if bytes[index] < b'9' {
+            bytes[index] += 1;
+            return String::from_utf8(bytes).expect("digits");
+        }
+        bytes[index] = b'0';
+    }
+    bytes.insert(0, b'1');
+    String::from_utf8(bytes).expect("digits")
 }
 
 fn last_has_newline(path: &Path) -> bool {
