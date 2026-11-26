@@ -88,3 +88,176 @@ jobs:
           path: ci-out/
           if-no-files-found: error
           retention-days: 14
+
+  coverage:
+    # Information only: how much of GNU patch (C) and of this Rust port the same
+    # GNU test suite reaches. Never part of the check verdict (continue-on-error),
+    # but it fails loudly when it cannot produce numbers.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    continue-on-error: true
+    env:
+      PATCH_VERSION: "2.8"
+      PATCH_SHA256: 308a4983ff324521b9b21310bfc2398ca861798f02307c79eb99bb0e0d2bf980
+      LLVM_COV_VERSION: "0.9.2"
+      LLVM_COV_SHA256: 1e0ed5c64f11e9217f7b9d7c776b3125eab26f27d49313919c909881a2fc7cff
+      GCOVR_VERSION: "8.8"
+      CARGO_TERM_COLOR: never
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Install coverage tools
+        run: |
+          set -eu
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          mkdir -p cov-out
+          rustup toolchain install nightly --profile minimal --component llvm-tools-preview --no-self-update
+          curl -fsSL -o /tmp/cargo-llvm-cov.tar.gz "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v$LLVM_COV_VERSION/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$LLVM_COV_SHA256  /tmp/cargo-llvm-cov.tar.gz" | sha256sum -c
+          tar -xzf /tmp/cargo-llvm-cov.tar.gz -C "$HOME/.cargo/bin"
+          cargo +nightly llvm-cov --version | tee cov-out/tools.txt
+          python3 -m venv /tmp/gcovr
+          /tmp/gcovr/bin/pip install -q "gcovr==$GCOVR_VERSION"
+          /tmp/gcovr/bin/gcovr --version | head -n 1 | tee -a cov-out/tools.txt
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ed libattr1-dev
+          gcc --version | head -n 1 | tee -a cov-out/tools.txt
+
+      - name: C coverage (GNU patch under its own test suite)
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/cov-out"
+          curl -fsSL -o "/tmp/patch-$PATCH_VERSION.tar.gz" "https://ftp.gnu.org/gnu/patch/patch-$PATCH_VERSION.tar.gz"
+          echo "$PATCH_SHA256  /tmp/patch-$PATCH_VERSION.tar.gz" | sha256sum -c
+          mkdir -p /tmp/patch-cov
+          tar -xzf "/tmp/patch-$PATCH_VERSION.tar.gz" -C /tmp/patch-cov
+          cd "/tmp/patch-cov/patch-$PATCH_VERSION"
+          ./configure --prefix=/usr/local CFLAGS="--coverage -O0 -g" LDFLAGS="--coverage"
+          make
+          rc=0
+          make check 2>&1 | tee "$out/c-suite.log" || rc=$?
+          echo "$rc" > "$out/c-suite.rc"
+          # gcovr warnings mean numbers we cannot trust: show them and stop.
+          /tmp/gcovr/bin/gcovr --root . --filter 'src/' --json-summary "$out/c-summary.json" --lcov "$out/c.lcov" 2> "$out/gcovr.err"
+          if [ -s "$out/gcovr.err" ]; then
+            cat "$out/gcovr.err" >&2
+            echo "::error::gcovr printed warnings; C coverage numbers are not trusted"
+            exit 1
+          fi
+
+      - name: Rust coverage (cargo test plus the same GNU suite)
+        timeout-minutes: 20
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/cov-out"
+          # RUSTFLAGS-based instrumentation (no RUSTC_WRAPPER), so the later
+          # `cargo llvm-cov report` calls in this same shell cannot recurse.
+          eval "$(cargo llvm-cov show-env --sh --branch --no-rustc-wrapper)"
+          cargo llvm-cov clean --workspace
+          cargo build
+          rc=0
+          scratch=$(mktemp -d)
+          (cd "$scratch" && PATCH="$GITHUB_WORKSPACE/target/debug/patch" "$GITHUB_WORKSPACE/tests/run_gnu_testsuite.sh") > "$out/rust-suite.log" 2>&1 || rc=$?
+          tail -n 1 "$out/rust-suite.log"
+          echo "$rc" > "$out/rust-suite.rc"
+          cargo llvm-cov report --branch --json --summary-only --output-path "$out/rust-suite-summary.json"
+          rc=0
+          cargo test 2>&1 | tee "$out/rust-cargo-test.log" || rc=$?
+          echo "$rc" > "$out/rust-cargo-test.rc"
+          cargo llvm-cov report --branch --json --summary-only --output-path "$out/rust-summary.json"
+          cargo llvm-cov report --branch --lcov --output-path "$out/rust.lcov"
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+          out = "cov-out"
+          errors = []
+
+          def load(name):
+              try:
+                  with open(os.path.join(out, name)) as f:
+                      return json.load(f)
+              except (OSError, ValueError) as e:
+                  errors.append(f"{name}: {type(e).__name__}")
+                  return None
+
+          def rc(name):
+              try:
+                  return int(open(os.path.join(out, name)).read().strip())
+              except (OSError, ValueError):
+                  errors.append(f"{name} missing")
+                  return None
+
+          def metric(covered, total, label):
+              if not isinstance(total, int) or not isinstance(covered, int) or total <= 0 or not 0 <= covered <= total:
+                  errors.append(f"{label}: no usable counts ({covered}/{total})")
+                  return None
+              return {"covered": covered, "total": total, "percent": round(100.0 * covered / total, 2)}
+
+          def rust(name, label):
+              d = load(name)
+              t = (((d or {}).get("data") or [{}])[0] or {}).get("totals") or {}
+              return {k: metric((t.get(src) or {}).get("covered"), (t.get(src) or {}).get("count"), f"{label} {k}")
+                      for k, src in (("line", "lines"), ("branch", "branches"), ("region", "regions"),
+                                     ("function", "functions"))}
+
+          c = load("c-summary.json") or {}
+          summary = {
+              "schema": 1,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "head_sha": os.environ["HEAD_SHA"],
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "c": {
+                  "tool": "GNU patch 2.8",
+                  "scope": "src/ only, gnulib excluded",
+                  "suite": "make check",
+                  "suite_exit": rc("c-suite.rc"),
+                  "line": metric(c.get("line_covered"), c.get("line_total"), "C line"),
+                  "branch": metric(c.get("branch_covered"), c.get("branch_total"), "C branch"),
+                  "function": metric(c.get("function_covered"), c.get("function_total"), "C function"),
+              },
+              "rust": dict(rust("rust-summary.json", "Rust"), suite="cargo test + GNU suite",
+                           suite_exit=rc("rust-suite.rc"), cargo_test_exit=rc("rust-cargo-test.rc")),
+              "rust_gnu_suite_only": rust("rust-suite-summary.json", "Rust GNU-suite-only"),
+          }
+          summary["errors"] = errors
+          with open(os.path.join(out, "coverage.json"), "w") as f:
+              json.dump(summary, f, indent=2)
+
+          def pct(m):
+              return f"{m['percent']:.1f}% ({m['covered']}/{m['total']})" if m else "MISSING"
+
+          rows = [("C: GNU patch, GNU suite (src/ only, gnulib excluded)", summary["c"]),
+                  ("Rust: port, GNU suite only", summary["rust_gnu_suite_only"]),
+                  ("Rust: port, GNU suite + cargo test", summary["rust"])]
+          md = ["## Coverage", "", "| Code | Lines | Branches | Regions |", "|---|---|---|---|"]
+          md += [f"| {n} | {pct(m.get('line'))} | {pct(m.get('branch'))} | {pct(m.get('region')) if 'region' in m else 'n/a'} |"
+                 for n, m in rows]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("\n".join(md) + "\n")
+          print("\n".join(md))
+          for e in errors:
+              print(f"::error::coverage: {e}")
+          sys.exit(1 if errors else 0)
+          PY
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: cov-out/
+          if-no-files-found: error
+          retention-days: 14
