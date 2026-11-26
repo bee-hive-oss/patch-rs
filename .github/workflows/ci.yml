@@ -138,16 +138,20 @@ jobs:
           mkdir -p /tmp/patch-cov
           tar -xzf "/tmp/patch-$PATCH_VERSION.tar.gz" -C /tmp/patch-cov
           cd "/tmp/patch-cov/patch-$PATCH_VERSION"
-          ./configure --prefix=/usr/local CFLAGS="--coverage -O0 -g" LDFLAGS="--coverage"
-          make
+          # Coverage flags go to make, not configure, so configure's own test
+          # programs leave no coverage data behind (gcovr would choke on it).
+          ./configure --prefix=/usr/local
+          make CFLAGS="--coverage -O0 -g" LDFLAGS="--coverage"
           rc=0
           make check 2>&1 | tee "$out/c-suite.log" || rc=$?
           echo "$rc" > "$out/c-suite.rc"
           # gcovr warnings mean numbers we cannot trust: show them and stop.
-          /tmp/gcovr/bin/gcovr --root . --filter 'src/' --json-summary "$out/c-summary.json" --lcov "$out/c.lcov" 2> "$out/gcovr.err"
-          if [ -s "$out/gcovr.err" ]; then
+          grc=0
+          /tmp/gcovr/bin/gcovr --root . --filter 'src/' --json-summary "$out/c-summary.json" --lcov "$out/c.lcov" 2> "$out/gcovr.err" || grc=$?
+          if [ "$grc" -ne 0 ] || [ -s "$out/gcovr.err" ]; then
+            echo "gcovr exit $grc" >&2
             cat "$out/gcovr.err" >&2
-            echo "::error::gcovr printed warnings; C coverage numbers are not trusted"
+            echo "::error::gcovr failed or printed warnings; C coverage numbers are not trusted"
             exit 1
           fi
 
