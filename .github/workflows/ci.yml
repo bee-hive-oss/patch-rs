@@ -57,9 +57,28 @@ jobs:
           set -euo pipefail
           mkdir -p ci-out
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          # The public test command is declared in repo-index.toml ([tests] command), else ./check.sh.
+          # Only ./check.sh with plain --flags is accepted; it runs as argv, never through a shell.
+          CHECK_CMD=$(python3 - <<'PY'
+          import re, sys, tomllib
+          try:
+              with open("repo-index.toml", "rb") as f:
+                  idx = tomllib.load(f)
+          except FileNotFoundError:
+              idx = {}
+          tests = idx.get("tests") or {}
+          cmd = tests.get("command", "./check.sh") if isinstance(tests, dict) else None
+          if not isinstance(cmd, str) or not re.fullmatch(r"\./check\.sh(?: --[a-z][a-z0-9-]*)*", cmd):
+              sys.exit("repo-index.toml [tests] command must be ./check.sh with plain --flags")
+          print(cmd)
+          PY
+          )
+          export CHECK_CMD
+          read -r -a CHECK_ARGV <<< "$CHECK_CMD"
+          echo "public test command: $CHECK_CMD"
           started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           rc=0
-          GNU_PATCH=/usr/local/bin/patch ./check.sh 2>&1 | tee ci-out/check.log || rc=$?
+          GNU_PATCH=/usr/local/bin/patch "${CHECK_ARGV[@]}" 2>&1 | tee ci-out/check.log || rc=$?
           cargo --version > ci-out/tools.txt
           cargo clippy --version >> ci-out/tools.txt
           /usr/local/bin/patch --version | head -n 1 >> ci-out/tools.txt
@@ -72,7 +91,7 @@ jobs:
               "head_sha": os.environ["HEAD_SHA"],
               "run_id": int(os.environ["GITHUB_RUN_ID"]),
               "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
-              "command": "./check.sh",
+              "command": os.environ["CHECK_CMD"],
               "exit_code": int(sys.argv[1]),
               "started": sys.argv[2],
               "finished": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
