@@ -6,6 +6,9 @@ license = "GPL-3.0-or-later"
 description = "Faithful Rust port of GNU patch 2.8"
 publish = false
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "patch"
 path = "src/main.rs"
