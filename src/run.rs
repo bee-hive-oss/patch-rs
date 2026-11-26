@@ -6,9 +6,11 @@
 //! until every file has been applied, so a later create still sees the
 //! original backup.
 
-use crate::apply::{self, format_reject_hunk, ApplyError, RejectNames, RejectStyle};
-use crate::cli::{self, BackupType, ForcedDiff, Options, ReadOnly, RejectFormat, Verbosity, EXIT_FAILURE};
-use crate::diff::{self, strip_name, DiffKind, FilePatch, Hunk};
+use crate::apply::{self, ApplyError, RejectNames, RejectStyle, format_reject_hunk};
+use crate::cli::{
+    self, BackupType, EXIT_FAILURE, ForcedDiff, Options, ReadOnly, RejectFormat, Verbosity,
+};
+use crate::diff::{self, DiffKind, FilePatch, Hunk, strip_name};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -139,27 +141,22 @@ impl<'a> Engine<'a> {
     }
 
     fn execute(&mut self) -> Result<i32, String> {
-        if let Some(path) = &self.opt.output {
-            if path != "-" {
-                self.outfile = Some(self.open_output(Path::new(path))?);
-            }
+        if let Some(path) = &self.opt.output
+            && path != "-"
+        {
+            self.outfile = Some(self.open_output(Path::new(path))?);
         }
         let input = self.read_patch()?;
-        if !self.opt.binary {
-            if let Some(line) = first_nul_line(&input) {
-                return Err(format!("patch line {line} contains NUL byte"));
-            }
+        if !self.opt.binary
+            && let Some(line) = first_nul_line(&input)
+        {
+            return Err(format!("patch line {line} contains NUL byte"));
         }
         let need_header = self.opt.original.is_none() && !self.opt.posix;
         let force_normal = self.opt.forced_diff == ForcedDiff::Normal;
         let force_ed = self.opt.forced_diff == ForcedDiff::Ed;
-        let parsed = diff::parse_patch_ex(
-            &input,
-            need_header,
-            force_normal,
-            force_ed,
-            self.opt.binary,
-        )?;
+        let parsed =
+            diff::parse_patch_ex(&input, need_header, force_normal, force_ed, self.opt.binary)?;
         if parsed.files.is_empty() {
             return self.no_files(&input);
         }
@@ -187,25 +184,25 @@ impl<'a> Engine<'a> {
 
     fn no_files(&mut self, input: &[u8]) -> Result<i32, String> {
         if input.is_empty() {
-            if let Some(from) = &self.opt.original {
-                if let Some(to) = &self.opt.output {
-                    if to != "-" && !self.opt.dry_run {
-                        if self.opt.verbosity != Verbosity::Silent {
-                            self.say(&format!(
-                                "patching file {} (read from {})\n",
-                                self.opt.quote(to),
-                                self.opt.quote(from)
-                            ));
-                        }
-                        let data = fs::read(from).unwrap_or_default();
-                        self.write_output_bytes(Path::new(to), &data, None)?;
-                    } else if self.opt.verbosity != Verbosity::Silent {
+            if let Some(from) = &self.opt.original
+                && let Some(to) = &self.opt.output
+            {
+                if to != "-" && !self.opt.dry_run {
+                    if self.opt.verbosity != Verbosity::Silent {
                         self.say(&format!(
                             "patching file {} (read from {})\n",
                             self.opt.quote(to),
                             self.opt.quote(from)
                         ));
                     }
+                    let data = fs::read(from).unwrap_or_default();
+                    self.write_output_bytes(Path::new(to), &data, None)?;
+                } else if self.opt.verbosity != Verbosity::Silent {
+                    self.say(&format!(
+                        "patching file {} (read from {})\n",
+                        self.opt.quote(to),
+                        self.opt.quote(from)
+                    ));
                 }
             }
             return Ok(0);
@@ -225,10 +222,9 @@ impl<'a> Engine<'a> {
         // A mangled first hunk dies before "patching file".
         if file.hunks.is_empty()
             && matches!(file.kind, DiffKind::Context | DiffKind::NewContext)
+            && let Some(error) = &file.parse_error
         {
-            if let Some(error) = &file.parse_error {
-                return Err(error.clone());
-            }
+            return Err(error.clone());
         }
         let names = self.strip_names(file);
         let patch_type = patch_file_type(file);
@@ -252,10 +248,12 @@ impl<'a> Engine<'a> {
             self.somefailed = true;
         }
         let outname = self.out_name(file, &names, &pick, reverse);
-        if file.git && !pick.skip && self.opt.output.is_none() {
-            if let Some(out) = &outname {
-                self.note_git_output_target(out)?;
-            }
+        if file.git
+            && !pick.skip
+            && self.opt.output.is_none()
+            && let Some(out) = &outname
+        {
+            self.note_git_output_target(out)?;
         }
         if !pick.skip && file.kind == DiffKind::GitBinary {
             if let Some(name) = &outname {
@@ -268,13 +266,13 @@ impl<'a> Engine<'a> {
             self.somefailed = true;
         }
         let mut info = InputInfo::missing();
-        if !pick.skip {
-            if let Some(name) = &pick.name {
-                info = self.load_input(name, patch_type)?;
-                if info.refused {
-                    pick.skip = true;
-                    self.somefailed = true;
-                }
+        if !pick.skip
+            && let Some(name) = &pick.name
+        {
+            info = self.load_input(name, patch_type)?;
+            if info.refused {
+                pick.skip = true;
+                self.somefailed = true;
             }
         }
         if self.read_only_blocked(&pick, &info) {
@@ -287,10 +285,10 @@ impl<'a> Engine<'a> {
         if file.kind != DiffKind::Ed && !pick.skip && self.opt.verbosity != Verbosity::Silent {
             self.say_patching(file, &names, &pick, &outname, patch_type);
         }
-        if file.hunks.is_empty() {
-            if let Some(error) = &file.parse_error {
-                return Err(error.clone());
-            }
+        if file.hunks.is_empty()
+            && let Some(error) = &file.parse_error
+        {
+            return Err(error.clone());
         }
         if file.kind == DiffKind::Ed {
             self.apply_ed(file, &pick, &outname, &info)?;
@@ -415,10 +413,10 @@ impl<'a> Engine<'a> {
         pick: &Pick,
         reverse: bool,
     ) -> Option<String> {
-        if let Some(path) = &self.opt.output {
-            if !pick.skip {
-                return Some(path.clone());
-            }
+        if let Some(path) = &self.opt.output
+            && !pick.skip
+        {
+            return Some(path.clone());
         }
         if pick.skip {
             return None;
@@ -600,23 +598,19 @@ impl Engine<'_> {
             return self.pick_explicit(file, explicit, patch_type, reverse);
         }
         let slots = [names.old.clone(), names.new.clone(), names.index.clone()];
-        let mut stats = [
-            StatBuf::missing(),
-            StatBuf::missing(),
-            StatBuf::missing(),
-        ];
+        let mut stats = [StatBuf::missing(), StatBuf::missing(), StatBuf::missing()];
         let mut i0: Option<usize> = None;
         let mut chosen: Option<usize> = None;
         for i in 0..3 {
             let Some(name) = slots[i].as_deref() else {
                 continue;
             };
-            if let Some(prev) = i0 {
-                if slots[prev].as_deref() == Some(name) {
-                    stats[i] = stats[prev];
-                    i0 = Some(i);
-                    continue;
-                }
+            if let Some(prev) = i0
+                && slots[prev].as_deref() == Some(name)
+            {
+                stats[i] = stats[prev];
+                i0 = Some(i);
+                continue;
             }
             stats[i] = self.conceal_deleted(inspect(name, self.opt.follow_symlinks));
             if stats[i].ok && self.opt.posix && self.name_is_valid(name, &mut warned) {
@@ -676,7 +670,8 @@ impl Engine<'_> {
     ) -> Pick {
         let stat = self.conceal_deleted(inspect(name, self.opt.follow_symlinks));
         if !stat.ok || stat.kind == patch_type {
-            let answer = self.maybe_reverse(file, name, !stat.ok, !stat.ok || stat.len == 0, *reverse);
+            let answer =
+                self.maybe_reverse(file, name, !stat.ok, !stat.ok || stat.len == 0, *reverse);
             *reverse = answer.reverse;
             return Pick {
                 name: Some(name.to_string()),
@@ -727,7 +722,11 @@ impl Engine<'_> {
         self.name_is_valid(old, warned) && self.name_is_valid(new, warned)
     }
 
-    fn best_fewest_dirs(&mut self, slots: &[Option<String>; 3], warned: &mut Vec<String>) -> Option<usize> {
+    fn best_fewest_dirs(
+        &mut self,
+        slots: &[Option<String>; 3],
+        warned: &mut Vec<String>,
+    ) -> Option<usize> {
         let mut dirs = [0i64; 3];
         let mut have = [false; 3];
         let mut min = i64::MAX;
@@ -918,14 +917,14 @@ impl Engine<'_> {
 
     fn ask(&mut self, prompt: &str) -> String {
         self.say(prompt);
-        if self.opt.posix || io::stdout().is_terminal() {
-            if let Ok(mut tty) = File::open("/dev/tty") {
-                let mut buf = [0u8; 256];
-                if let Ok(n) = tty.read(&mut buf) {
-                    if n > 0 {
-                        return String::from_utf8_lossy(&buf[..n]).into_owned();
-                    }
-                }
+        if (self.opt.posix || io::stdout().is_terminal())
+            && let Ok(mut tty) = File::open("/dev/tty")
+        {
+            let mut buf = [0u8; 256];
+            if let Ok(n) = tty.read(&mut buf)
+                && n > 0
+            {
+                return String::from_utf8_lossy(&buf[..n]).into_owned();
             }
         }
         self.say("\n");
@@ -1009,12 +1008,7 @@ impl Engine<'_> {
             if hunk_failed {
                 let rej_names = reject_names(names, reverse);
                 reject.extend(format_reject_hunk(
-                    hunk,
-                    file.kind,
-                    style,
-                    out_offset,
-                    &rej_names,
-                    header,
+                    hunk, file.kind, style, out_offset, &rej_names, header,
                 ));
                 header = false;
                 failed += 1;
@@ -1028,9 +1022,7 @@ impl Engine<'_> {
                     } else {
                         ""
                     };
-                    self.say(&format!(
-                        "Hunk #{hunk_no} {what} at {newwhere}{endings}.\n"
-                    ));
+                    self.say(&format!("Hunk #{hunk_no} {what} at {newwhere}{endings}.\n"));
                 }
             } else if self.opt.verbosity == Verbosity::Verbose
                 || (self.opt.verbosity != Verbosity::Silent && (fuzz_used != 0 || in_offset != 0))
@@ -1165,9 +1157,8 @@ impl Engine<'_> {
         let skip = pick.skip || applied.skip;
         if self.opt.output.is_some() {
             if let Some(out) = self.outfile.as_mut() {
-                out.write_all(&applied.output).map_err(|err| {
-                    format!("write error : {}", cli::io_error_text(&err))
-                })?;
+                out.write_all(&applied.output)
+                    .map_err(|err| format!("write error : {}", cli::io_error_text(&err)))?;
             }
             return Ok(());
         }
@@ -1180,7 +1171,9 @@ impl Engine<'_> {
         let says_new = says(file, !applied.reverse);
         let zero = applied.output.is_empty();
         let delete = zero
-            && (self.opt.remove_empty || (!self.opt.posix && says_new == 2) || info.kind == S_IFLNK);
+            && (self.opt.remove_empty
+                || (!self.opt.posix && says_new == 2)
+                || info.kind == S_IFLNK);
         let backup = self.wants_backup(applied);
         if delete {
             if !self.opt.dry_run && info.exists {
@@ -1239,12 +1232,11 @@ impl Engine<'_> {
                 .map_err(|err| format!("write error : {}", cli::io_error_text(&err)))?;
             self.note_replaced(out, previous);
         }
-        if file.rename {
-            if let Some(src) = &pick.name {
-                if src != out {
-                    self.queue_delete(src, backup)?;
-                }
-            }
+        if file.rename
+            && let Some(src) = &pick.name
+            && src != out
+        {
+            self.queue_delete(src, backup)?;
         }
         Ok(())
     }
@@ -1252,15 +1244,15 @@ impl Engine<'_> {
     /// If this output inode already has a queued replacement, write queued
     /// files first. Then remember the inode so the next patch can do the same.
     fn note_git_output_target(&mut self, out: &str) -> Result<(), String> {
-        if let Some((dev, ino)) = file_ids(out, self.opt.follow_symlinks) {
-            if self.queued_inodes.iter().any(|id| *id == (dev, ino)) {
-                self.flush_queued_outputs()?;
-            }
+        if let Some((dev, ino)) = file_ids(out, self.opt.follow_symlinks)
+            && self.queued_inodes.contains(&(dev, ino))
+        {
+            self.flush_queued_outputs()?;
         }
-        if let Some((dev, ino)) = file_ids(out, self.opt.follow_symlinks) {
-            if !self.queued_inodes.iter().any(|id| *id == (dev, ino)) {
-                self.queued_inodes.push((dev, ino));
-            }
+        if let Some((dev, ino)) = file_ids(out, self.opt.follow_symlinks)
+            && !self.queued_inodes.contains(&(dev, ino))
+        {
+            self.queued_inodes.push((dev, ino));
         }
         Ok(())
     }
@@ -1293,7 +1285,12 @@ impl Engine<'_> {
         self.create_backup(path, true, true)
     }
 
-    fn create_backup(&mut self, path: &str, exists: bool, leave_original: bool) -> Result<(), String> {
+    fn create_backup(
+        &mut self,
+        path: &str,
+        exists: bool,
+        leave_original: bool,
+    ) -> Result<(), String> {
         if exists {
             let meta = match metadata_of(path, self.opt.follow_symlinks) {
                 Ok(meta) => meta,
@@ -1445,14 +1442,14 @@ impl Engine<'_> {
             let previous = file_ids(&item.name, self.opt.follow_symlinks);
             if item.backup {
                 self.create_backup(&item.name, previous.is_some(), false)?;
-            } else if let Err(err) = fs::remove_file(&item.name) {
-                if err.kind() != io::ErrorKind::NotFound {
-                    return Err(format!(
-                        "Can't remove file {} : {}",
-                        self.opt.quote(&item.name),
-                        cli::io_error_text(&err)
-                    ));
-                }
+            } else if let Err(err) = fs::remove_file(&item.name)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                return Err(format!(
+                    "Can't remove file {} : {}",
+                    self.opt.quote(&item.name),
+                    cli::io_error_text(&err)
+                ));
             }
             if let Some((dev, ino)) = previous {
                 self.remember(dev, ino, IdKind::Overwritten);
@@ -1506,7 +1503,11 @@ impl Engine<'_> {
     }
 
     fn remember(&mut self, dev: u64, ino: u64, kind: IdKind) {
-        if let Some(rec) = self.files.iter_mut().find(|rec| rec.dev == dev && rec.ino == ino) {
+        if let Some(rec) = self
+            .files
+            .iter_mut()
+            .find(|rec| rec.dev == dev && rec.ino == ino)
+        {
             rec.kind = kind;
             return;
         }
@@ -1550,10 +1551,10 @@ impl Engine<'_> {
     }
 
     fn reject_path(&self, outname: &str) -> String {
-        if let Some(path) = &self.opt.reject_file {
-            if path != "-" {
-                return path.clone();
-            }
+        if let Some(path) = &self.opt.reject_file
+            && path != "-"
+        {
+            return path.clone();
         }
         let mut rej = format!("{outname}.rej");
         if rej.ends_with('~') {
@@ -1615,7 +1616,11 @@ impl Engine<'_> {
                 cli::io_error_text(&err)
             )
         })?;
-        let initial = if info.exists { info.data.as_slice() } else { b"" };
+        let initial = if info.exists {
+            info.data.as_slice()
+        } else {
+            b""
+        };
         fs::write(&out_path, initial).map_err(|err| {
             format!(
                 "Can't create file {} : {}",
@@ -1654,10 +1659,11 @@ impl Engine<'_> {
     }
 
     fn place(&mut self, path: &Path, data: &[u8], mode: Option<u32>) -> Result<(), io::Error> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent)?;
         }
         self.tmp_seq += 1;
         let tmp_name = format!(".patch-rs-{}-{}", std::process::id(), self.tmp_seq);
@@ -1723,16 +1729,18 @@ impl Engine<'_> {
                 self.opt.quote(&path.display().to_string())
             ));
         }
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() && !self.opt.dry_run {
-                fs::create_dir_all(parent).map_err(|err| {
-                    format!(
-                        "Can't create file {} : {}",
-                        self.opt.quote(&path.display().to_string()),
-                        cli::io_error_text(&err)
-                    )
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+            && !self.opt.dry_run
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "Can't create file {} : {}",
+                    self.opt.quote(&path.display().to_string()),
+                    cli::io_error_text(&err)
+                )
+            })?;
         }
         OpenOptions::new()
             .write(true)
@@ -1860,11 +1868,7 @@ fn patch_file_type(file: &FilePatch) -> u32 {
     let old = file.old_mode & S_IFMT;
     let new = file.new_mode & S_IFMT;
     if old != 0 {
-        if new != 0 && old != new {
-            0
-        } else {
-            old
-        }
+        if new != 0 && old != new { 0 } else { old }
     } else if new != 0 {
         new
     } else {
@@ -2060,7 +2064,11 @@ fn split_dir_base(path: &str) -> (&str, &str) {
 
 /// The highest `base.~N~` in `dir`, incremented. `None` when no numbered backup exists.
 fn next_numbered_name(dir: &str, base: &str) -> Option<String> {
-    let folder = if dir.is_empty() { "." } else { dir.trim_end_matches('/') };
+    let folder = if dir.is_empty() {
+        "."
+    } else {
+        dir.trim_end_matches('/')
+    };
     let entries = fs::read_dir(folder).ok()?;
     let mut best: Option<String> = None;
     for entry in entries.flatten() {

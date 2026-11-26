@@ -13,7 +13,9 @@ pub enum RejectStyle {
     Unified,
     /// `new_style` selects ` ****` / ` ----` markers. Old context and normal
     /// diffs use a blank star marker and ` -----`.
-    Context { new_style: bool },
+    Context {
+        new_style: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -29,7 +31,10 @@ pub struct RejectNames<'a> {
 pub enum ApplyError {
     Misordered,
     /// `old` and `new` are hunk-relative line indexes, as GNU reports them.
-    Mangled { old: i64, new: i64 },
+    Mangled {
+        old: i64,
+        new: i64,
+    },
 }
 
 #[derive(Clone, Debug)]
