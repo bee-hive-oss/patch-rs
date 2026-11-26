@@ -142,6 +142,8 @@ pub struct FilePatch {
     /// Set when a later hunk in this file is malformed. Earlier hunks are
     /// still applied; GNU patch dies when it reads the bad hunk.
     pub parse_error: Option<String>,
+    /// Drop a trailing CR from hunk lines. Cleared by `--binary`.
+    pub strip_trailing_cr: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,6 +168,7 @@ pub fn parse_patch_ex(
     mut need_header: bool,
     force_normal: bool,
     force_ed: bool,
+    binary: bool,
 ) -> Result<Parsed, String> {
     if force_normal || force_ed {
         need_header = false;
@@ -184,7 +187,7 @@ pub fn parse_patch_ex(
         if lines[index..].iter().all(|line| line.raw.is_empty()) {
             break;
         }
-        let (file, next) = parse_one(&lines, index, need_header, force_normal, force_ed)?;
+        let (file, next) = parse_one(&lines, index, need_header, force_normal, force_ed, binary)?;
         if file.is_none() && files.is_empty() {
             return Ok(Parsed {
                 files,
@@ -252,7 +255,7 @@ fn starts_with(line: &SrcLine, prefix: &str) -> bool {
 }
 
 pub fn parse_patch(input: &[u8]) -> Result<Parsed, String> {
-    parse_patch_ex(input, false, false, false)
+    parse_patch_ex(input, false, false, false, false)
 }
 
 fn parse_one(
@@ -261,6 +264,7 @@ fn parse_one(
     mut need_header: bool,
     force_normal: bool,
     force_ed: bool,
+    binary: bool,
 ) -> Result<(Option<FilePatch>, usize), String> {
     let mut index = start;
     let mut old_name = None;
@@ -282,6 +286,9 @@ fn parse_one(
     let mut hunks = Vec::new();
     let mut ed_script = Vec::new();
     let mut saw_header = false;
+    // GNU records this from Index, ---, +++, the first ed/normal command,
+    // and the context range line. The last of those wins. `--binary` clears it.
+    let mut strip_cr = false;
 
     while index < lines.len() {
         let line = &lines[index];
@@ -368,6 +375,7 @@ fn parse_one(
             index_name = name;
             saw_header = true;
             need_header = false;
+            strip_cr = line_has_cr(line);
             index += 1;
             continue;
         }
@@ -387,6 +395,7 @@ fn parse_one(
             new_stamp = stamp;
             saw_header = true;
             need_header = false;
+            strip_cr = line_has_cr(line);
             index += 1;
             continue;
         }
@@ -397,6 +406,7 @@ fn parse_one(
             old_stamp = stamp;
             saw_header = true;
             need_header = false;
+            strip_cr = line_has_cr(line);
             index += 1;
             continue;
         }
@@ -435,6 +445,8 @@ fn parse_one(
                 if next_indent == line_indent(line.raw.as_slice()).0
                     && looks_like_context_range(next_trim.as_bytes())
                 {
+                    // The range line, not the `---` header, decides for context.
+                    strip_cr = line_has_cr(next);
                     kind = Some(DiffKind::Context);
                     break;
                 }
@@ -443,27 +455,33 @@ fn parse_one(
         if !need_header && is_normal_command(trimmed.as_bytes()) {
             // Look ahead a little: `<` / `>` means normal, a lone `.` means ed.
             if force_ed && looks_ed_body(lines, index) {
+                strip_cr = line_has_cr(line);
                 kind = Some(DiffKind::Ed);
                 break;
             }
             if !force_ed && looks_normal_body(lines, index) {
+                strip_cr = line_has_cr(line);
                 kind = Some(DiffKind::Normal);
                 break;
             }
             if looks_ed_body(lines, index) && !force_normal {
+                strip_cr = line_has_cr(line);
                 kind = Some(DiffKind::Ed);
                 break;
             }
             if looks_normal_body(lines, index) {
+                strip_cr = line_has_cr(line);
                 kind = Some(DiffKind::Normal);
                 break;
             }
         }
         if !need_header && force_ed && is_ed_command(trimmed.as_bytes()) {
+            strip_cr = line_has_cr(line);
             kind = Some(DiffKind::Ed);
             break;
         }
         if !need_header && is_ed_command(trimmed.as_bytes()) && looks_ed_body(lines, index) {
+            strip_cr = line_has_cr(line);
             kind = Some(DiffKind::Ed);
             break;
         }
@@ -499,11 +517,23 @@ fn parse_one(
     let report_line = lines.get(hunk_at).map(|line| line.num).unwrap_or(1);
     let leading = join_lines(&lines[start..hunk_at.min(lines.len())]);
     let mut parse_error = None;
+    if binary {
+        strip_cr = false;
+    }
+    // Hunk text is re-read with CRs removed. The scan above kept them, which
+    // is how GNU decides whether to strip in the first place.
+    let stripped;
+    let src: &[SrcLine] = if strip_cr {
+        stripped = strip_trailing_crs(lines);
+        &stripped
+    } else {
+        lines
+    };
 
     match kind {
         DiffKind::Unified => {
-            while index < lines.len() && line_str(&lines[index]).trim_start().starts_with("@@ -") {
-                match parse_unified_hunk(lines, index) {
+            while index < src.len() && line_str(&src[index]).trim_start().starts_with("@@ -") {
+                match parse_unified_hunk(src, index) {
                     Ok((hunk, next)) => {
                         hunks.push(hunk);
                         index = next;
@@ -516,7 +546,7 @@ fn parse_one(
             }
         }
         DiffKind::Context | DiffKind::NewContext => {
-            let parsed = parse_context_hunks(lines, index, old_stamp);
+            let parsed = parse_context_hunks(src, index, old_stamp);
             hunks = parsed.hunks;
             index = parsed.index;
             if parsed.new_context {
@@ -531,8 +561,8 @@ fn parse_one(
             }
         }
         DiffKind::Normal => {
-            while index < lines.len() && is_normal_command(line_str(&lines[index]).as_bytes()) {
-                match parse_normal_hunk(lines, index) {
+            while index < src.len() && is_normal_command(line_str(&src[index]).as_bytes()) {
+                match parse_normal_hunk(src, index) {
                     Ok((hunk, next)) => {
                         hunks.push(hunk);
                         index = next;
@@ -545,8 +575,8 @@ fn parse_one(
             }
         }
         DiffKind::Ed => {
-            while index < lines.len() {
-                let text = line_str(&lines[index]);
+            while index < src.len() {
+                let text = line_str(&src[index]);
                 let trimmed = trim_indent(&text);
                 if (is_minus_header(trimmed.as_bytes()) || trimmed.starts_with("diff "))
                     && !ed_script.is_empty()
@@ -554,13 +584,13 @@ fn parse_one(
                     break;
                 }
                 if is_ed_command(trimmed.as_bytes()) || !ed_script.is_empty() {
-                    push_raw(&mut ed_script, &lines[index]);
+                    push_raw(&mut ed_script, &src[index]);
                     let done = trimmed == ".";
                     index += 1;
                     if done {
                         // Keep reading until the next file header.
-                        while index < lines.len() {
-                            let next = trim_indent(&line_str(&lines[index]));
+                        while index < src.len() {
+                            let next = trim_indent(&line_str(&src[index]));
                             if is_minus_header(next.as_bytes())
                                 || next.starts_with("diff ")
                                 || is_star_header(next.as_bytes())
@@ -602,6 +632,7 @@ fn parse_one(
         ed_script,
         leading,
         report_line,
+        strip_cr,
     );
     file.parse_error = parse_error;
     Ok((Some(file), index))
@@ -628,6 +659,7 @@ fn finish(
     ed_script: Vec<u8>,
     leading: Vec<u8>,
     report_line: i64,
+    strip_trailing_cr: bool,
 ) -> FilePatch {
     FilePatch {
         kind,
@@ -650,7 +682,29 @@ fn finish(
         leading,
         report_line,
         parse_error: None,
+        strip_trailing_cr,
     }
+}
+
+fn line_has_cr(line: &SrcLine) -> bool {
+    line.nl && line.raw.last() == Some(&b'\r')
+}
+
+fn strip_trailing_crs(lines: &[SrcLine]) -> Vec<SrcLine> {
+    lines
+        .iter()
+        .map(|line| {
+            let mut raw = line.raw.clone();
+            if line_has_cr(line) {
+                raw.pop();
+            }
+            SrcLine {
+                num: line.num,
+                raw,
+                nl: line.nl,
+            }
+        })
+        .collect()
 }
 
 fn push_raw(buf: &mut Vec<u8>, line: &SrcLine) {
@@ -1635,6 +1689,7 @@ fn is_star_header(bytes: &[u8]) -> bool {
 }
 
 fn is_normal_command(bytes: &[u8]) -> bool {
+    let bytes = without_trailing_cr(bytes);
     let mut s = 0usize;
     if s >= bytes.len() || !bytes[s].is_ascii_digit() {
         return false;
@@ -1655,7 +1710,16 @@ fn is_normal_command(bytes: &[u8]) -> bool {
     s == bytes.len()
 }
 
+fn without_trailing_cr(bytes: &[u8]) -> &[u8] {
+    if bytes.last() == Some(&b'\r') {
+        &bytes[..bytes.len() - 1]
+    } else {
+        bytes
+    }
+}
+
 fn is_ed_command(bytes: &[u8]) -> bool {
+    let bytes = without_trailing_cr(bytes);
     let mut s = 0usize;
     if s < bytes.len() && bytes[s].is_ascii_digit() {
         while s < bytes.len() && bytes[s].is_ascii_digit() {
@@ -1691,7 +1755,7 @@ fn looks_ed_body(lines: &[SrcLine], command: usize) -> bool {
         .iter()
         .skip(command + 1)
         .take(40)
-        .any(|line| line.raw == b".")
+        .any(|line| line.raw == b"." || line.raw == b".\r")
 }
 
 fn git_pair(bytes: &[u8]) -> Option<(String, String)> {

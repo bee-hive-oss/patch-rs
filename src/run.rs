@@ -138,7 +138,13 @@ impl<'a> Engine<'a> {
         let need_header = self.opt.original.is_none() && !self.opt.posix;
         let force_normal = self.opt.forced_diff == ForcedDiff::Normal;
         let force_ed = self.opt.forced_diff == ForcedDiff::Ed;
-        let parsed = diff::parse_patch_ex(&input, need_header, force_normal, force_ed)?;
+        let parsed = diff::parse_patch_ex(
+            &input,
+            need_header,
+            force_normal,
+            force_ed,
+            self.opt.binary,
+        )?;
         if parsed.files.is_empty() {
             return self.no_files(&input);
         }
@@ -246,6 +252,9 @@ impl<'a> Engine<'a> {
         if self.read_only_blocked(&pick, &info) {
             pick.skip = true;
             self.somefailed = true;
+        }
+        if file.strip_trailing_cr && self.opt.verbosity != Verbosity::Silent {
+            self.say("(Stripping trailing CRs from patch; use --binary to disable.)\n");
         }
         if file.kind != DiffKind::Ed && !pick.skip && self.opt.verbosity != Verbosity::Silent {
             self.say_patching(file, &names, &pick, &outname, patch_type);
