@@ -1,0 +1,47 @@
+# GNU patch 2.8 suite tests patch-rs must keep passing (./check.sh fails on
+# any regression). Append a test here in the PR that makes it pass.
+# Baseline: 44/49, measured on Rust 1.100.0 from a clean release build.
+asymmetric-hunks
+backup-prefix-suffix
+bad-filenames
+bad-usage
+concat-git-diff
+copy-rename
+corrupt-patch
+corrupt-reject-files
+create-delete
+create-directory
+criss-cross
+crlf-handling
+deep-directories
+ed-style
+empty-files
+false-match
+fifo
+file-create-modes
+file-modes
+filename-choice
+git-binary-diff
+git-cleanup
+garbage
+global-reject-files
+hardlinks
+inname
+line-numbers
+mangled-numbers-abort
+mixed-patch-types
+munged-context-format
+need-filename
+no-backup
+no-mode-change-git-diff
+no-newline-triggers-assert
+preserve-c-function-names
+quoted-filenames
+read-only-files
+regression-abe92e8010ab
+reject-format
+remember-backup-files
+remember-reject-files
+remove-directories
+unmodified-files
+unusual-blanks
