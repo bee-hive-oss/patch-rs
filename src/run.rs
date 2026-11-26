@@ -32,6 +32,11 @@ struct Engine<'a> {
     /// Inodes this run has created, overwritten, or scheduled for deletion.
     files: Vec<FileRec>,
     pending_deletes: Vec<PendingDelete>,
+    /// Git diffs write these after later patches have read the old bytes.
+    pending_outputs: Vec<PendingOutput>,
+    /// Inodes whose queued replacement must be flushed before they are read.
+    queued_inodes: Vec<(u64, u64)>,
+    was_git: bool,
 }
 
 struct Names {
@@ -88,6 +93,13 @@ struct PendingDelete {
     backup: bool,
 }
 
+struct PendingOutput {
+    path: String,
+    bytes: Vec<u8>,
+    mode: Option<u32>,
+    backup: bool,
+}
+
 #[derive(Clone, Copy)]
 struct StatBuf {
     ok: bool,
@@ -120,6 +132,9 @@ impl<'a> Engine<'a> {
             seen_file: false,
             files: Vec::new(),
             pending_deletes: Vec::new(),
+            pending_outputs: Vec::new(),
+            queued_inodes: Vec::new(),
+            was_git: false,
         }
     }
 
@@ -149,11 +164,19 @@ impl<'a> Engine<'a> {
             return self.no_files(&input);
         }
         for file in &parsed.files {
-            self.apply_file(file)?;
+            if self.was_git && !file.git {
+                self.flush_queued_outputs()?;
+            }
+            self.was_git = file.git;
+            if let Err(err) = self.apply_file(file) {
+                let _ = self.flush_queued_outputs();
+                return Err(err);
+            }
         }
         if self.opt.verbosity == Verbosity::Verbose {
             self.say("done\n");
         }
+        self.flush_queued_outputs()?;
         self.flush_deletes()?;
         if self.somefailed {
             Ok(EXIT_FAILURE)
@@ -229,6 +252,11 @@ impl<'a> Engine<'a> {
             self.somefailed = true;
         }
         let outname = self.out_name(file, &names, &pick, reverse);
+        if file.git && !pick.skip && self.opt.output.is_none() {
+            if let Some(out) = &outname {
+                self.note_git_output_target(out)?;
+            }
+        }
         if !pick.skip && file.kind == DiffKind::GitBinary {
             if let Some(name) = &outname {
                 self.say(&format!(
@@ -1192,19 +1220,62 @@ impl Engine<'_> {
             None
         };
         let previous = file_ids(out, self.opt.follow_symlinks);
-        if backup {
-            self.create_backup(out, previous.is_some(), false)?;
+        // A git diff that edits an existing file keeps the old bytes readable
+        // until a later patch in the series needs this output inode.
+        let delay = file.git && says(file, applied.reverse) != 2 && self.opt.output.is_none();
+        if delay {
+            self.pending_outputs.push(PendingOutput {
+                path: out.to_string(),
+                bytes: applied.output.clone(),
+                mode,
+                backup,
+            });
+        } else {
+            if backup {
+                self.create_backup(out, previous.is_some(), false)?;
+            }
+            self.reject_newline_name(Path::new(out))?;
+            self.place(Path::new(out), &applied.output, mode)
+                .map_err(|err| format!("write error : {}", cli::io_error_text(&err)))?;
+            self.note_replaced(out, previous);
         }
-        self.reject_newline_name(Path::new(out))?;
-        self.place(Path::new(out), &applied.output, mode)
-            .map_err(|err| format!("write error : {}", cli::io_error_text(&err)))?;
-        self.note_replaced(out, previous);
         if file.rename {
             if let Some(src) = &pick.name {
                 if src != out {
                     self.queue_delete(src, backup)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// If this output inode already has a queued replacement, write queued
+    /// files first. Then remember the inode so the next patch can do the same.
+    fn note_git_output_target(&mut self, out: &str) -> Result<(), String> {
+        if let Some((dev, ino)) = file_ids(out, self.opt.follow_symlinks) {
+            if self.queued_inodes.iter().any(|id| *id == (dev, ino)) {
+                self.flush_queued_outputs()?;
+            }
+        }
+        if let Some((dev, ino)) = file_ids(out, self.opt.follow_symlinks) {
+            if !self.queued_inodes.iter().any(|id| *id == (dev, ino)) {
+                self.queued_inodes.push((dev, ino));
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_queued_outputs(&mut self) -> Result<(), String> {
+        let pending = std::mem::take(&mut self.pending_outputs);
+        for item in pending {
+            let previous = file_ids(&item.path, self.opt.follow_symlinks);
+            if item.backup {
+                self.create_backup(&item.path, previous.is_some(), false)?;
+            }
+            self.reject_newline_name(Path::new(&item.path))?;
+            self.place(Path::new(&item.path), &item.bytes, item.mode)
+                .map_err(|err| format!("write error : {}", cli::io_error_text(&err)))?;
+            self.note_replaced(&item.path, previous);
         }
         Ok(())
     }
