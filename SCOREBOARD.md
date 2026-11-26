@@ -20,3 +20,4 @@ Each row is measured from a clean clone in a rootless Podman image (Rust
 | Date (CT) | Commit | Cargo tests | Clippy | Self-check | Starter cases | GNU patch testsuite | Note |
 |---|---|---|---|---|---|---|---|
 | 2026-11-26 08:45 | `3c65e03` | 27 pass | 27 lints | 47/49 | n/a | 44/49 | initial port by Grok Build, pushed by Nori Nov 26; failing: context-format, dash-o-append (both upstream XFAIL), merge, preserve-mode-and-timestamp, symlinks; clippy 0.1.100 reports 22 collapsible_if, 2 manual contains, 3 sliced_string_as_bytes |
+| 2026-11-26 08:55 | `1dc8fc5` | 27 pass | clean | 47/49 | n/a | 44/49 | PR #2 merged Nov 26: rustfmt pass and the 27 clippy 0.1.100 lints fixed, no behavior change |
