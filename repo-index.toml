@@ -5,3 +5,6 @@ github_tests = true               # public ./check.sh also runs on GitHub for ea
 
 [scoreboard]
 auto = true                       # automatic SCOREBOARD.md rows
+
+[tests]
+command = "./check.sh"            # the public test command, run on GitHub and on Levo
