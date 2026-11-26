@@ -1377,8 +1377,28 @@ impl Engine<'_> {
             if let Some((dev, ino)) = previous {
                 self.remember(dev, ino, IdKind::Overwritten);
             }
+            self.removedirs(&item.name);
         }
         Ok(())
+    }
+
+    /// Drop empty parents of a deleted file. `.` and `..` are left alone.
+    fn removedirs(&mut self, name: &str) {
+        let bytes = name.as_bytes();
+        let mut index = bytes.len();
+        while index > 0 {
+            index -= 1;
+            if bytes[index] != b'/' || skip_removedir(bytes, index) {
+                continue;
+            }
+            let dir = &name[..index];
+            if fs::remove_dir(dir).is_ok() && self.opt.verbosity == Verbosity::Verbose {
+                self.say(&format!(
+                    "Removed empty directory {}\n",
+                    self.opt.quote(dir)
+                ));
+            }
+        }
     }
 
     fn note_replaced(&mut self, path: &str, previous: Option<(u64, u64)>) {
@@ -1935,6 +1955,20 @@ fn versioned_backup_name(path: &str, kind: BackupType, simple_suffix: &str) -> S
         let name = numbered.unwrap_or_else(|| format!("{base}.~1~"));
         format!("{dir}{name}")
     }
+}
+
+/// True when the slash at `index` ends a `.` or `..` component, or a doubled slash.
+fn skip_removedir(bytes: &[u8], index: usize) -> bool {
+    if index == 0 || bytes[index - 1] == b'/' {
+        return true;
+    }
+    if bytes[index - 1] != b'.' {
+        return false;
+    }
+    if index == 1 || bytes[index - 2] == b'/' {
+        return true;
+    }
+    bytes[index - 2] == b'.' && (index == 2 || bytes[index - 3] == b'/')
 }
 
 fn split_dir_base(path: &str) -> (&str, &str) {
