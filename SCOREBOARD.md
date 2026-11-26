@@ -28,6 +28,7 @@ Coverage columns added 2026-11-26. New rows include C lines %, C branches %, Rus
 | Date (CT) | Commit | Cargo tests | Clippy | Self-check | Starter cases | GNU patch testsuite | C lines % | C branches % | Rust lines % | Rust branches % | Note |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 2026-11-26 16:42 | `7a9c511` | 28 pass | clean | 47/49 | n/a | 44/49 | 76.4% | 65.3% | 81.6% | 70.2% | pushed to main Nov 26: Opt patch-rs in to public check.sh on GitHub (repo-index.toml) |
+| 2026-11-26 17:05 | `f2883d4` | 28 pass | clean | 47/49 | n/a | 44/49 | 76.4% | 65.3% | 81.6% | 70.2% | pushed to main Nov 26: Declare patch-rs's public test command in repo-index.toml |
 
 ## Upstream C bugs fixed
 
