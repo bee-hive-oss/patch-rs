@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PATCH_VERSION: "2.8"
+      PATCH_SHA256: 308a4983ff324521b9b21310bfc2398ca861798f02307c79eb99bb0e0d2bf980
+      RUST_TOOLCHAIN: stable
+      CARGO_TERM_COLOR: never
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -eu
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          cargo --version
+          cargo clippy --version
+
+      - name: Build GNU patch reference
+        run: |
+          set -eu
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ed libattr1-dev
+          curl -fsSL -o "/tmp/patch-$PATCH_VERSION.tar.gz" "https://ftp.gnu.org/gnu/patch/patch-$PATCH_VERSION.tar.gz"
+          echo "$PATCH_SHA256  /tmp/patch-$PATCH_VERSION.tar.gz" | sha256sum -c
+          mkdir -p /tmp/patch-build
+          tar -xzf "/tmp/patch-$PATCH_VERSION.tar.gz" -C /tmp/patch-build
+          cd "/tmp/patch-build/patch-$PATCH_VERSION"
+          ./configure --prefix=/usr/local
+          make
+          sudo make install
+          /usr/local/bin/patch --version | head -n 1 | grep -qx "GNU patch $PATCH_VERSION"
+
+      - name: Run ./check.sh
+        run: |
+          set -euo pipefail
+          mkdir -p ci-out
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          rc=0
+          GNU_PATCH=/usr/local/bin/patch ./check.sh 2>&1 | tee ci-out/check.log || rc=$?
+          cargo --version > ci-out/tools.txt
+          cargo clippy --version >> ci-out/tools.txt
+          /usr/local/bin/patch --version | head -n 1 >> ci-out/tools.txt
+          python3 - "$rc" "$started" <<'PY'
+          import json, os, sys, datetime
+          json.dump({
+              "schema": 1,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "event": os.environ["GITHUB_EVENT_NAME"],
+              "head_sha": os.environ["HEAD_SHA"],
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "command": "./check.sh",
+              "exit_code": int(sys.argv[1]),
+              "started": sys.argv[2],
+              "finished": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }, open("ci-out/result.json", "w"), indent=2)
+          PY
+          exit "$rc"
+
+      - name: Upload logs and result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-result
+          path: ci-out/
+          if-no-files-found: error
+          retention-days: 14
