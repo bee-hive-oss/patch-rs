@@ -631,7 +631,13 @@ impl Engine<'_> {
                 Some(i) => stats[i].kind == patch_type,
                 None => true,
             };
-            if i0.is_some() && (chosen.is_none() || type_ok) {
+            // GNU patch 2.8.1 checks this name before maybe_reverse. A reversed
+            // delete of a missing file would create it (CVE-2026-115207).
+            if let Some(fallback) = i0
+                && let Some(fallback_name) = slots[fallback].as_deref()
+                && self.name_is_valid(fallback_name, &mut warned)
+                && (chosen.is_none() || type_ok)
+            {
                 let idx = chosen.or(i0).unwrap();
                 let name = slots[idx].as_deref().unwrap_or("");
                 let nonexistent = chosen.is_none();
@@ -2137,5 +2143,191 @@ fn gnu_temp_label(path: &Path, seq: u64) -> String {
             parent.join(file).to_string_lossy().into_owned()
         }
         _ => file,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+    use crate::cli::{self, ProcessEnv};
+    use std::fs;
+    use std::io::{self, Read, Write};
+    use std::os::unix::io::FromRawFd;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    fn clean_env() -> ProcessEnv {
+        ProcessEnv {
+            posixly_correct: false,
+            quoting_style: None,
+            patch_get: None,
+            simple_backup_suffix: None,
+            patch_version_control: None,
+            version_control: None,
+        }
+    }
+
+    fn apply_in_dir(patch: &Path, args: &[&str]) -> (i32, String) {
+        let mut argv = vec!["patch".to_string()];
+        argv.extend(args.iter().copied().map(str::to_string));
+        argv.push("-i".to_string());
+        argv.push(patch.display().to_string());
+        let opt = cli::parse_with(&argv, &clean_env()).unwrap_or_else(|_| panic!("parse failed"));
+        let mut status = 0;
+        let output = capture_stdout(|| {
+            status = run(&opt);
+        });
+        (status, output)
+    }
+
+    /// `say` writes to the real stdout fd. The caller holds the test lock.
+    fn capture_stdout(body: impl FnOnce()) -> String {
+        let capture = StdoutCapture::start();
+        body();
+        capture.finish()
+    }
+
+    struct StdoutCapture {
+        saved: i32,
+        read: i32,
+        active: bool,
+    }
+
+    impl StdoutCapture {
+        fn start() -> Self {
+            let _ = io::stdout().flush();
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0, "pipe");
+            let saved = unsafe { dup(1) };
+            assert!(saved >= 0, "dup stdout");
+            assert_eq!(unsafe { dup2(fds[1], 1) }, 1, "redirect stdout");
+            assert_eq!(unsafe { close(fds[1]) }, 0, "close pipe write");
+            Self {
+                saved,
+                read: fds[0],
+                active: true,
+            }
+        }
+
+        fn finish(mut self) -> String {
+            let _ = io::stdout().flush();
+            self.restore();
+            let fd = self.read;
+            self.read = -1;
+            let mut file = unsafe { fs::File::from_raw_fd(fd) };
+            let mut out = Vec::new();
+            file.read_to_end(&mut out).unwrap();
+            String::from_utf8(out)
+                .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+        }
+
+        fn restore(&mut self) {
+            if !self.active {
+                return;
+            }
+            unsafe {
+                dup2(self.saved, 1);
+                close(self.saved);
+            }
+            self.active = false;
+        }
+    }
+
+    impl Drop for StdoutCapture {
+        fn drop(&mut self) {
+            self.restore();
+            if self.read >= 0 {
+                unsafe { close(self.read) };
+                self.read = -1;
+            }
+        }
+    }
+
+    unsafe extern "C" {
+        fn pipe(fds: *mut i32) -> i32;
+        fn dup(fd: i32) -> i32;
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+
+    struct CwdGuard(PathBuf);
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    struct TmpGuard(PathBuf);
+
+    impl Drop for TmpGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn reverse_delete_rejects_out_of_tree_names() {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _lock = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+
+        let root = std::env::temp_dir().join(format!("patch-rs-cve-115207-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let work = root.join("w");
+        fs::create_dir_all(&work).unwrap();
+        let original = std::env::current_dir().unwrap();
+        let _tmp = TmpGuard(root.clone());
+        let _cwd = CwdGuard(original);
+        std::env::set_current_dir(&work).unwrap();
+
+        let abs = root.join("absout");
+        let abs_text = abs.display().to_string();
+        let patch = root.join("q.diff");
+        fs::write(
+            &patch,
+            format!("--- {abs_text}\n+++ {abs_text}\n@@ -1 +0,0 @@\n-data\n"),
+        )
+        .unwrap();
+        let (status, output) = apply_in_dir(&patch, &["-p0", "-t"]);
+        let expected = format!(
+            "\
+Ignoring potentially dangerous file name {abs_text}
+can't find file to patch at input line 3
+Perhaps you used the wrong -p or --strip option?
+The text leading up to this was:
+--------------------------
+|--- {abs_text}
+|+++ {abs_text}
+--------------------------
+No file to patch.  Skipping patch.
+1 out of 1 hunk ignored
+"
+        );
+        assert_eq!(output, expected);
+        assert_eq!(status, 1);
+        assert!(!abs.exists(), "absolute out-of-tree file was created");
+        assert!(!root.join("absout.rej").exists());
+        assert!(!root.join("absout.orig").exists());
+
+        let rel_patch = root.join("r.diff");
+        fs::write(&rel_patch, "--- relout\n+++ relout\n@@ -1 +0,0 @@\n-data\n").unwrap();
+        let (status, output) = apply_in_dir(&rel_patch, &["-p0", "-t"]);
+        assert_eq!(status, 0, "{output}");
+        assert_eq!(fs::read(work.join("relout")).unwrap(), b"data\n");
+        assert!(output.contains("Assuming -R.\n"));
+        assert!(output.contains("patching file relout\n"));
+        assert!(!output.contains("dangerous"));
+
+        let dot_patch = root.join("d.diff");
+        fs::write(
+            &dot_patch,
+            "--- ../dotout\n+++ ../dotout\n@@ -1 +0,0 @@\n-data\n",
+        )
+        .unwrap();
+        let (status, output) = apply_in_dir(&dot_patch, &["-p0", "-t"]);
+        assert_eq!(status, 1, "{output}");
+        assert!(!root.join("dotout").exists());
+        assert!(output.starts_with("Ignoring potentially dangerous file name ../dotout\n"));
+        assert!(!output.contains("patching file"));
     }
 }
