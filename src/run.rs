@@ -6,9 +6,11 @@
 //! until every file has been applied, so a later create still sees the
 //! original backup.
 
-use crate::apply::{self, format_reject_hunk, ApplyError, RejectNames, RejectStyle};
-use crate::cli::{self, BackupType, ForcedDiff, Options, ReadOnly, RejectFormat, Verbosity, EXIT_FAILURE};
-use crate::diff::{self, strip_name, DiffKind, FilePatch, Hunk};
+use crate::apply::{self, ApplyError, RejectNames, RejectStyle, format_reject_hunk};
+use crate::cli::{
+    self, BackupType, EXIT_FAILURE, ForcedDiff, Options, ReadOnly, RejectFormat, Verbosity,
+};
+use crate::diff::{self, DiffKind, FilePatch, Hunk, strip_name};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -153,13 +155,8 @@ impl<'a> Engine<'a> {
         let need_header = self.opt.original.is_none() && !self.opt.posix;
         let force_normal = self.opt.forced_diff == ForcedDiff::Normal;
         let force_ed = self.opt.forced_diff == ForcedDiff::Ed;
-        let parsed = diff::parse_patch_ex(
-            &input,
-            need_header,
-            force_normal,
-            force_ed,
-            self.opt.binary,
-        )?;
+        let parsed =
+            diff::parse_patch_ex(&input, need_header, force_normal, force_ed, self.opt.binary)?;
         if parsed.files.is_empty() {
             return self.no_files(&input);
         }
@@ -223,9 +220,7 @@ impl<'a> Engine<'a> {
         }
         // Context hunks are parsed while GNU is still choosing a file name.
         // A mangled first hunk dies before "patching file".
-        if file.hunks.is_empty()
-            && matches!(file.kind, DiffKind::Context | DiffKind::NewContext)
-        {
+        if file.hunks.is_empty() && matches!(file.kind, DiffKind::Context | DiffKind::NewContext) {
             if let Some(error) = &file.parse_error {
                 return Err(error.clone());
             }
@@ -600,11 +595,7 @@ impl Engine<'_> {
             return self.pick_explicit(file, explicit, patch_type, reverse);
         }
         let slots = [names.old.clone(), names.new.clone(), names.index.clone()];
-        let mut stats = [
-            StatBuf::missing(),
-            StatBuf::missing(),
-            StatBuf::missing(),
-        ];
+        let mut stats = [StatBuf::missing(), StatBuf::missing(), StatBuf::missing()];
         let mut i0: Option<usize> = None;
         let mut chosen: Option<usize> = None;
         for i in 0..3 {
@@ -676,7 +667,8 @@ impl Engine<'_> {
     ) -> Pick {
         let stat = self.conceal_deleted(inspect(name, self.opt.follow_symlinks));
         if !stat.ok || stat.kind == patch_type {
-            let answer = self.maybe_reverse(file, name, !stat.ok, !stat.ok || stat.len == 0, *reverse);
+            let answer =
+                self.maybe_reverse(file, name, !stat.ok, !stat.ok || stat.len == 0, *reverse);
             *reverse = answer.reverse;
             return Pick {
                 name: Some(name.to_string()),
@@ -727,7 +719,11 @@ impl Engine<'_> {
         self.name_is_valid(old, warned) && self.name_is_valid(new, warned)
     }
 
-    fn best_fewest_dirs(&mut self, slots: &[Option<String>; 3], warned: &mut Vec<String>) -> Option<usize> {
+    fn best_fewest_dirs(
+        &mut self,
+        slots: &[Option<String>; 3],
+        warned: &mut Vec<String>,
+    ) -> Option<usize> {
         let mut dirs = [0i64; 3];
         let mut have = [false; 3];
         let mut min = i64::MAX;
@@ -1009,12 +1005,7 @@ impl Engine<'_> {
             if hunk_failed {
                 let rej_names = reject_names(names, reverse);
                 reject.extend(format_reject_hunk(
-                    hunk,
-                    file.kind,
-                    style,
-                    out_offset,
-                    &rej_names,
-                    header,
+                    hunk, file.kind, style, out_offset, &rej_names, header,
                 ));
                 header = false;
                 failed += 1;
@@ -1028,9 +1019,7 @@ impl Engine<'_> {
                     } else {
                         ""
                     };
-                    self.say(&format!(
-                        "Hunk #{hunk_no} {what} at {newwhere}{endings}.\n"
-                    ));
+                    self.say(&format!("Hunk #{hunk_no} {what} at {newwhere}{endings}.\n"));
                 }
             } else if self.opt.verbosity == Verbosity::Verbose
                 || (self.opt.verbosity != Verbosity::Silent && (fuzz_used != 0 || in_offset != 0))
@@ -1165,9 +1154,8 @@ impl Engine<'_> {
         let skip = pick.skip || applied.skip;
         if self.opt.output.is_some() {
             if let Some(out) = self.outfile.as_mut() {
-                out.write_all(&applied.output).map_err(|err| {
-                    format!("write error : {}", cli::io_error_text(&err))
-                })?;
+                out.write_all(&applied.output)
+                    .map_err(|err| format!("write error : {}", cli::io_error_text(&err)))?;
             }
             return Ok(());
         }
@@ -1180,7 +1168,9 @@ impl Engine<'_> {
         let says_new = says(file, !applied.reverse);
         let zero = applied.output.is_empty();
         let delete = zero
-            && (self.opt.remove_empty || (!self.opt.posix && says_new == 2) || info.kind == S_IFLNK);
+            && (self.opt.remove_empty
+                || (!self.opt.posix && says_new == 2)
+                || info.kind == S_IFLNK);
         let backup = self.wants_backup(applied);
         if delete {
             if !self.opt.dry_run && info.exists {
@@ -1293,7 +1283,12 @@ impl Engine<'_> {
         self.create_backup(path, true, true)
     }
 
-    fn create_backup(&mut self, path: &str, exists: bool, leave_original: bool) -> Result<(), String> {
+    fn create_backup(
+        &mut self,
+        path: &str,
+        exists: bool,
+        leave_original: bool,
+    ) -> Result<(), String> {
         if exists {
             let meta = match metadata_of(path, self.opt.follow_symlinks) {
                 Ok(meta) => meta,
@@ -1506,7 +1501,11 @@ impl Engine<'_> {
     }
 
     fn remember(&mut self, dev: u64, ino: u64, kind: IdKind) {
-        if let Some(rec) = self.files.iter_mut().find(|rec| rec.dev == dev && rec.ino == ino) {
+        if let Some(rec) = self
+            .files
+            .iter_mut()
+            .find(|rec| rec.dev == dev && rec.ino == ino)
+        {
             rec.kind = kind;
             return;
         }
@@ -1615,7 +1614,11 @@ impl Engine<'_> {
                 cli::io_error_text(&err)
             )
         })?;
-        let initial = if info.exists { info.data.as_slice() } else { b"" };
+        let initial = if info.exists {
+            info.data.as_slice()
+        } else {
+            b""
+        };
         fs::write(&out_path, initial).map_err(|err| {
             format!(
                 "Can't create file {} : {}",
@@ -1860,11 +1863,7 @@ fn patch_file_type(file: &FilePatch) -> u32 {
     let old = file.old_mode & S_IFMT;
     let new = file.new_mode & S_IFMT;
     if old != 0 {
-        if new != 0 && old != new {
-            0
-        } else {
-            old
-        }
+        if new != 0 && old != new { 0 } else { old }
     } else if new != 0 {
         new
     } else {
@@ -2060,7 +2059,11 @@ fn split_dir_base(path: &str) -> (&str, &str) {
 
 /// The highest `base.~N~` in `dir`, incremented. `None` when no numbered backup exists.
 fn next_numbered_name(dir: &str, base: &str) -> Option<String> {
-    let folder = if dir.is_empty() { "." } else { dir.trim_end_matches('/') };
+    let folder = if dir.is_empty() {
+        "."
+    } else {
+        dir.trim_end_matches('/')
+    };
     let entries = fs::read_dir(folder).ok()?;
     let mut best: Option<String> = None;
     for entry in entries.flatten() {

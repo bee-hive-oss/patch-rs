@@ -1410,16 +1410,21 @@ fn parse_context_hunk(
         ));
     }
     if fillcnt != 0 {
-        fill_omitted(&mut slots, fillsrc, filldst, fillcnt, repl_beginning, hunk_beg)?;
+        fill_omitted(
+            &mut slots,
+            fillsrc,
+            filldst,
+            fillcnt,
+            repl_beginning,
+            hunk_beg,
+        )?;
     }
     let mut hunk_lines: Vec<HunkLine> = slots.into_iter().flatten().collect();
     hunk_lines.push(HunkLine {
         ch: b'^',
         text: Vec::new(),
     });
-    let new_style = stars
-        || fillcnt != 0
-        || (old_first > 1 && prefix + suffix < ptrn_copiable);
+    let new_style = stars || fillcnt != 0 || (old_first > 1 && prefix + suffix < ptrn_copiable);
     Ok(BuiltContext {
         hunk: Hunk {
             old_first,
@@ -1454,11 +1459,7 @@ enum Take {
     Missing,
 }
 
-fn take_context_line(
-    line: &SrcLine,
-    body: &[u8],
-    side: ContextSide<'_>,
-) -> Result<Take, String> {
+fn take_context_line(line: &SrcLine, body: &[u8], side: ContextSide<'_>) -> Result<Take, String> {
     let marker = body.first().copied();
     if matches!(marker, Some(b'+') | Some(b'!')) {
         *side.could_miss = false;
@@ -1538,7 +1539,10 @@ fn fill_omitted(
     while fillcnt > 0 {
         while fillsrc < slots.len() as i64
             && fillsrc != repl
-            && slots.get(fillsrc as usize).and_then(|slot| slot.as_ref()).is_some_and(|line| line.ch != b' ')
+            && slots
+                .get(fillsrc as usize)
+                .and_then(|slot| slot.as_ref())
+                .is_some_and(|line| line.ch != b' ')
         {
             fillsrc += 1;
         }
@@ -1927,7 +1931,14 @@ fn epoch_window(timestr: &str) -> bool {
             .and_then(|text| text.parse::<i64>().ok())
             .unwrap_or(i64::MAX)
     };
-    let secs = civil_utc_secs(num(0, 4), num(5, 7), num(8, 10), num(11, 13), num(14, 16), num(17, 19));
+    let secs = civil_utc_secs(
+        num(0, 4),
+        num(5, 7),
+        num(8, 10),
+        num(11, 13),
+        num(14, 16),
+        num(17, 19),
+    );
     (-25 * 3600..26 * 3600).contains(&secs)
 }
 
