@@ -23,6 +23,12 @@ Each row is measured from a clean clone in a rootless Podman image (Rust
 | 2026-11-26 08:55 | `1dc8fc5` | 27 pass | clean | 47/49 | n/a | 44/49 | PR #2 merged Nov 26: rustfmt pass and the 27 clippy 0.1.100 lints fixed, no behavior change |
 | 2026-11-26 11:25 | `6353d53` | 28 pass | clean | 47/49 | n/a | 44/49 | PR #22 merged Nov 26: Reject absolute out-of-tree creates on reverse delete (CVE-2026-115207 / GNU patch 2.8) |
 
+Coverage columns added 2026-11-26. New rows include C lines %, C branches %, Rust lines %, and Rust branches % from the GitHub coverage run on that commit (Rust figures are the GNU test suite alone). Earlier rows keep their original columns.
+
+| Date (CT) | Commit | Cargo tests | Clippy | Self-check | Starter cases | GNU patch testsuite | C lines % | C branches % | Rust lines % | Rust branches % | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-11-26 16:42 | `7a9c511` | 28 pass | clean | 47/49 | n/a | 44/49 | 76.4% | 65.3% | 81.6% | 70.2% | pushed to main Nov 26: Opt patch-rs in to public check.sh on GitHub (repo-index.toml) |
+
 ## Upstream C bugs fixed
 
 Bugs in the original C tool (the same pinned GNU version as the table
