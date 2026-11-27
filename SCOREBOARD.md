@@ -32,6 +32,7 @@ Coverage columns added 2026-11-26. New rows include C lines %, C branches %, Rus
 | 2026-11-26 19:57 | `7b80169` | 28 pass | clean | RED | n/a | 44/49 | 76.4% | 65.3% | 81.6% | 70.2% | PR #35 merged Nov 26: Build the starter-case harness that compares patch-rs with GNU patch 2.8 |
 | 2026-11-26 20:19 | `779173f` | 28 pass | clean | 47/49 | n/a | 44/49 | 76.4% | 65.3% | 81.6% | 70.2% | PR #38 merged Nov 26: Starter cases for normal diffs: change, add and delete |
 | 2026-11-26 20:22 | `54bce0e` | 28 pass | clean | 47/49 | n/a | 44/49 | 76.4% | 65.3% | 81.6% | 70.2% | PR #39 merged Nov 26: Starter cases for ed-style diffs: change, append and delete |
+| 2026-11-26 20:32 | `f94a520` | 28 pass | clean | RED | n/a | 44/49 | 76.4% | 65.3% | 81.6% | 70.2% | PR #41 merged Nov 26: Starter cases for fuzz: fuzz 1 applies and fuzz 0 rejects |
 
 ## Upstream C bugs fixed
 
