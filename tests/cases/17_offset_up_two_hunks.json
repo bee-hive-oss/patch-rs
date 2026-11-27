@@ -1,0 +1,7 @@
+{
+  "args": [],
+  "files": {
+    "a.txt": "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n"
+  },
+  "stdin": "--- a.txt\n+++ a.txt\n@@ -4,3 +4,3 @@\n line2\n-line3\n+LINE3\n line4\n@@ -10,3 +10,3 @@\n line8\n-line9\n+LINE9\n line10\n"
+}
