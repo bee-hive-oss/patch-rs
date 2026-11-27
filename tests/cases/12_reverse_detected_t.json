@@ -1,0 +1,9 @@
+{
+  "args": [
+    "-t"
+  ],
+  "files": {
+    "a.txt": "one\nTWO\nthree\n"
+  },
+  "stdin": "--- a.txt\n+++ a.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"
+}
