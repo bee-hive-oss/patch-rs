@@ -29,6 +29,7 @@ Coverage columns added 2026-11-26. New rows include C lines %, C branches %, Rus
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 2026-11-26 16:42 | `7a9c511` | 28 pass | clean | 47/49 | n/a | 44/49 | 76.4% | 65.3% | 81.6% | 70.2% | pushed to main Nov 26: Opt patch-rs in to public check.sh on GitHub (repo-index.toml) |
 | 2026-11-26 17:05 | `f2883d4` | 28 pass | clean | 47/49 | n/a | 44/49 | 76.4% | 65.3% | 81.6% | 70.2% | pushed to main Nov 26: Declare patch-rs's public test command in repo-index.toml |
+| 2026-11-26 19:57 | `7b80169` | 28 pass | clean | RED | n/a | 44/49 | 76.4% | 65.3% | 81.6% | 70.2% | PR #35 merged Nov 26: Build the starter-case harness that compares patch-rs with GNU patch 2.8 |
 
 ## Upstream C bugs fixed
 
