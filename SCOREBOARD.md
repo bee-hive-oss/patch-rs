@@ -35,6 +35,7 @@ Coverage columns added 2026-11-26. New rows include C lines %, C branches %, Rus
 | 2026-11-26 20:32 | `f94a520` | 28 pass | clean | RED | n/a | 44/49 | 76.4% | 65.3% | 81.6% | 70.2% | PR #41 merged Nov 26: Starter cases for fuzz: fuzz 1 applies and fuzz 0 rejects |
 | 2026-11-26 20:38 | `225d043` | 28 pass | clean | 47/49 | n/a | 44/49 | 76.4% | 65.3% | 81.6% | 70.2% | PR #42 merged Nov 26: Starter cases for offsets: positive and negative line offsets |
 | 2026-11-26 20:48 | `0559708` | 28 pass | clean | 47/49 | n/a | 45/49 | 76.4% | 65.3% | 81.1% | 69.2% | PR #44 merged Nov 26: Port --merge conflict output so the GNU merge script passes |
+| 2026-11-26 20:54 | `10d9f96` | 28 pass | clean | RED | n/a | 46/49 | 76.4% | 65.3% | 80.6% | 67.8% | PR #46 merged Nov 26: Set file times for --set-time and --set-utc so the GNU preserve-mode-and-timestamp script passes |
 
 ## Upstream C bugs fixed
 
