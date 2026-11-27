@@ -18,6 +18,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, UNIX_EPOCH};
 
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
@@ -63,6 +64,8 @@ struct InputInfo {
     mode: u32,
     kind: u32,
     refused: bool,
+    /// Modification time captured before the file is replaced.
+    mtime: Option<(i64, u32)>,
 }
 
 struct Applied {
@@ -104,6 +107,8 @@ struct PendingOutput {
     bytes: Vec<u8>,
     mode: Option<u32>,
     backup: bool,
+    /// Set after the delayed write. `None` leaves the write time alone.
+    mtime: Option<(i64, u32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -515,6 +520,7 @@ impl<'a> Engine<'a> {
                 mode: meta_perm(&meta),
                 kind,
                 refused: true,
+                mtime: file_mtime(&meta),
             });
         }
         if kind == S_IFLNK {
@@ -526,6 +532,7 @@ impl<'a> Engine<'a> {
                 mode: meta_perm(&meta),
                 kind,
                 refused: false,
+                mtime: file_mtime(&meta),
             });
         }
         if meta.len() == 0 {
@@ -536,6 +543,7 @@ impl<'a> Engine<'a> {
                 mode: meta_perm(&meta),
                 kind,
                 refused: false,
+                mtime: file_mtime(&meta),
             });
         }
         let data = fs::read(path).map_err(|err| {
@@ -552,6 +560,7 @@ impl<'a> Engine<'a> {
             mode: meta_perm(&meta),
             kind,
             refused: false,
+            mtime: file_mtime(&meta),
         })
     }
 
@@ -585,6 +594,7 @@ impl InputInfo {
             mode: 0o666,
             kind: S_IFREG,
             refused: false,
+            mtime: None,
         }
     }
 }
@@ -1268,12 +1278,14 @@ impl Engine<'_> {
         // A git diff that edits an existing file keeps the old bytes readable
         // until a later patch in the series needs this output inode.
         let delay = file.git && says(file, applied.reverse) != 2 && self.opt.output.is_none();
+        let mtime = self.chosen_mtime(file, info, applied, out);
         if delay {
             self.pending_outputs.push(PendingOutput {
                 path: out.to_string(),
                 bytes: applied.output.clone(),
                 mode,
                 backup,
+                mtime,
             });
         } else {
             if backup {
@@ -1282,6 +1294,10 @@ impl Engine<'_> {
             self.reject_newline_name(Path::new(out))?;
             self.place(Path::new(out), &applied.output, mode)
                 .map_err(|err| format!("write error : {}", cli::io_error_text(&err)))?;
+            if let Some((sec, nsec)) = mtime {
+                set_mtime(Path::new(out), sec, nsec)
+                    .map_err(|err| format!("write error : {}", cli::io_error_text(&err)))?;
+            }
             self.note_replaced(out, previous);
         }
         if file.rename
@@ -1319,9 +1335,50 @@ impl Engine<'_> {
             self.reject_newline_name(Path::new(&item.path))?;
             self.place(Path::new(&item.path), &item.bytes, item.mode)
                 .map_err(|err| format!("write error : {}", cli::io_error_text(&err)))?;
+            if let Some((sec, nsec)) = item.mtime {
+                set_mtime(Path::new(&item.path), sec, nsec)
+                    .map_err(|err| format!("write error : {}", cli::io_error_text(&err)))?;
+            }
             self.note_replaced(&item.path, previous);
         }
         Ok(())
+    }
+
+    /// Header time to apply, or `None` when GNU would leave the write time.
+    ///
+    /// A skip prints "Not setting time of file …" before the failure summary.
+    fn chosen_mtime(
+        &mut self,
+        file: &FilePatch,
+        info: &InputInfo,
+        applied: &Applied,
+        out: &str,
+    ) -> Option<(i64, u32)> {
+        if self.opt.dry_run || !(self.opt.set_time || self.opt.set_utc) {
+            return None;
+        }
+        let assume_utc = self.opt.set_utc || tz_is_utc();
+        let new_time = header_time(side_timestr(file, !applied.reverse), assume_utc)?;
+        let old_time = header_time(side_timestr(file, applied.reverse), assume_utc);
+        let quoted = self.opt.quote(out);
+        if !self.opt.force
+            && info.exists
+            && says(file, applied.reverse) != 2
+            && let Some(old) = old_time
+            && info.mtime.is_some_and(|cur| cur != old)
+        {
+            self.say(&format!(
+                "Not setting time of file {quoted} (time mismatch)\n"
+            ));
+            None
+        } else if !self.opt.force && (applied.mismatch || applied.failed > 0) {
+            self.say(&format!(
+                "Not setting time of file {quoted} (contents mismatch)\n"
+            ));
+            None
+        } else {
+            Some(new_time)
+        }
     }
 
     fn wants_backup(&self, applied: &Applied) -> bool {
@@ -1890,6 +1947,157 @@ fn reject_names(names: &Names, reverse: bool) -> RejectNames<'_> {
             new_time: &names.new_time,
         }
     }
+}
+
+fn side_timestr(file: &FilePatch, which_new: bool) -> &str {
+    if which_new {
+        &file.new_timestr
+    } else {
+        &file.old_timestr
+    }
+}
+
+fn file_mtime(meta: &fs::Metadata) -> Option<(i64, u32)> {
+    let modified = meta.modified().ok()?;
+    let dur = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some((dur.as_secs() as i64, dur.subsec_nanos()))
+}
+
+fn set_mtime(path: &Path, sec: i64, nsec: u32) -> io::Result<()> {
+    if sec < 0 {
+        return Err(io::Error::other("time out of range"));
+    }
+    let when = UNIX_EPOCH.checked_add(Duration::new(sec as u64, nsec)).ok_or_else(|| {
+        io::Error::other("time out of range")
+    })?;
+    let file = File::open(path)?;
+    file.set_modified(when)
+}
+
+fn tz_is_utc() -> bool {
+    matches!(
+        std::env::var("TZ").as_deref(),
+        Ok("UTC" | "UTC0" | "GMT" | "GMT0" | "UCT")
+    )
+}
+
+/// Parse a unified or context header time. A numeric zone is absolute.
+/// A zone-less time is UTC when `--set-utc` is set or `TZ` is UTC.
+fn header_time(timestr: &str, assume_utc: bool) -> Option<(i64, u32)> {
+    let bytes = timestr.trim_start_matches([' ', '\t']).as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let digit = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
+    if !(digit(0)
+        && digit(1)
+        && digit(2)
+        && digit(3)
+        && bytes[4] == b'-'
+        && digit(5)
+        && digit(6)
+        && bytes[7] == b'-'
+        && digit(8)
+        && digit(9)
+        && matches!(bytes[10], b' ' | b'T')
+        && digit(11)
+        && digit(12)
+        && bytes[13] == b':'
+        && digit(14)
+        && digit(15)
+        && bytes[16] == b':'
+        && digit(17)
+        && digit(18))
+    {
+        return None;
+    }
+    let num = |a: usize, b: usize| {
+        std::str::from_utf8(&bytes[a..b])
+            .ok()
+            .and_then(|text| text.parse::<i64>().ok())
+    };
+    let year = num(0, 4)?;
+    let month = num(5, 7)?;
+    let day = num(8, 10)?;
+    let hour = num(11, 13)?;
+    let min = num(14, 16)?;
+    let sec = num(17, 19)?;
+    let mut i = 19usize;
+    let mut nsec = 0u32;
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        let mut digits = 0u32;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            if digits < 9 {
+                nsec = nsec * 10 + u32::from(bytes[i] - b'0');
+                digits += 1;
+            }
+            i += 1;
+        }
+        while digits < 9 {
+            nsec *= 10;
+            digits += 1;
+        }
+    }
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    let offset = if i < bytes.len() && matches!(bytes[i], b'+' | b'-' | b'Z' | b'z') {
+        parse_zone(&bytes[i..])?
+    } else if assume_utc {
+        0
+    } else {
+        return None;
+    };
+    let secs = civil_utc_secs(year, month, day, hour, min, sec)?;
+    Some((secs - offset, nsec))
+}
+
+fn parse_zone(bytes: &[u8]) -> Option<i64> {
+    if bytes.first().is_some_and(|b| *b == b'Z' || *b == b'z') {
+        return Some(0);
+    }
+    let sign = match bytes.first() {
+        Some(b'+') => 1i64,
+        Some(b'-') => -1,
+        _ => return None,
+    };
+    let b = &bytes[1..];
+    if b.len() < 2 || !b[0].is_ascii_digit() || !b[1].is_ascii_digit() {
+        return None;
+    }
+    let hour = i64::from(b[0] - b'0') * 10 + i64::from(b[1] - b'0');
+    let mut i = 2usize;
+    let mut min = 0i64;
+    let mut sec = 0i64;
+    if b.get(i) == Some(&b':') {
+        i += 1;
+    }
+    if i + 1 < b.len() && b[i].is_ascii_digit() && b[i + 1].is_ascii_digit() {
+        min = i64::from(b[i] - b'0') * 10 + i64::from(b[i + 1] - b'0');
+        i += 2;
+        if b.get(i) == Some(&b':') {
+            i += 1;
+        }
+        if i + 1 < b.len() && b[i].is_ascii_digit() && b[i + 1].is_ascii_digit() {
+            sec = i64::from(b[i] - b'0') * 10 + i64::from(b[i + 1] - b'0');
+        }
+    }
+    Some(sign * (hour * 3600 + min * 60 + sec))
+}
+
+fn civil_utc_secs(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
 }
 
 fn says(file: &FilePatch, which_new: bool) -> u8 {
