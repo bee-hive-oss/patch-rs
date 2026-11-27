@@ -10,7 +10,7 @@ RUN rustup component add clippy
 
 ARG PATCH_VERSION=2.8
 ARG PATCH_SHA256=308a4983ff324521b9b21310bfc2398ca861798f02307c79eb99bb0e0d2bf980
-RUN curl -fsSL -o /tmp/patch.tar.gz "https://ftp.gnu.org/gnu/patch/patch-${PATCH_VERSION}.tar.gz" \
+RUN curl -fsSL -o /tmp/patch.tar.gz "https://ftpmirror.gnu.org/gnu/patch/patch-${PATCH_VERSION}.tar.gz" \
     && echo "${PATCH_SHA256}  /tmp/patch.tar.gz" | sha256sum -c \
     && mkdir /tmp/pb && tar -xzf /tmp/patch.tar.gz -C /tmp/pb \
     && cd /tmp/pb/patch-${PATCH_VERSION} && ./configure --prefix=/usr/local >/dev/null && make -j"$(nproc)" >/dev/null && make install >/dev/null \
