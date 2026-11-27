@@ -1,0 +1,9 @@
+{
+  "args": [
+    "a.txt"
+  ],
+  "files": {
+    "a.txt": "one\ntwo\nthree\n"
+  },
+  "stdin": "1d0\n< one\n3a3\n> four\n"
+}
