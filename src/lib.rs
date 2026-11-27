@@ -3,5 +3,6 @@
 pub mod apply;
 pub mod cli;
 pub mod diff;
+pub mod merge;
 pub mod quote;
 pub mod run;

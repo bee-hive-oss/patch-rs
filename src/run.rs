@@ -8,9 +8,11 @@
 
 use crate::apply::{self, ApplyError, RejectNames, RejectStyle, format_reject_hunk};
 use crate::cli::{
-    self, BackupType, EXIT_FAILURE, ForcedDiff, Options, ReadOnly, RejectFormat, Verbosity,
+    self, BackupType, ConflictStyle, EXIT_FAILURE, ForcedDiff, Options, ReadOnly, RejectFormat,
+    Verbosity,
 };
 use crate::diff::{self, DiffKind, FilePatch, Hunk, strip_name};
+use crate::merge;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -72,6 +74,8 @@ struct Applied {
     reject: Vec<u8>,
     /// True when any locate needed fuzz, an offset, or failed to match.
     mismatch: bool,
+    /// A `--merge` hunk wrote conflict markers.
+    conflict: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -296,7 +300,7 @@ impl<'a> Engine<'a> {
             return Ok(());
         }
         let applied = self.apply_hunks(file, &names, &info, reverse, pick.skip)?;
-        if applied.failed > 0 || applied.skip {
+        if applied.failed > 0 || applied.skip || applied.conflict {
             self.somefailed = true;
         }
         self.finish_output(file, &pick, &outname, &info, &applied)?;
@@ -963,6 +967,7 @@ impl Engine<'_> {
         let mut out_offset = 0i64;
         let mut failed = 0i64;
         let mut mismatch = false;
+        let mut conflict = false;
         let mut header = true;
         let mut reject = Vec::new();
         let mut apply_anyway = false;
@@ -995,7 +1000,41 @@ impl Engine<'_> {
             let says_old = says(file, reverse);
             let blocked = where_line == Some(1) && says_old == 2 && info.len != 0;
             let mut hunk_failed = skip || blocked || where_line.is_none();
-            if !hunk_failed {
+            if self.opt.merge && !skip {
+                let located = where_line.unwrap_or(0);
+                let diff3 = self.opt.conflict_style == ConflictStyle::Diff3;
+                let verbose = self.opt.verbosity == Verbosity::Verbose;
+                let silent = self.opt.verbosity == Verbosity::Silent;
+                let ignore_ws = self.opt.ignore_whitespace;
+                match merge::merge_hunk(
+                    hunk,
+                    &lines,
+                    located,
+                    hunk_no,
+                    diff3,
+                    verbose,
+                    silent,
+                    ignore_ws,
+                    in_offset,
+                    &mut output,
+                    &mut frozen,
+                    &mut out_offset,
+                    &mut |text| self.say(text),
+                ) {
+                    Ok(had_conflict) => {
+                        hunk_failed = false;
+                        if had_conflict {
+                            conflict = true;
+                        }
+                    }
+                    Err(ApplyError::Misordered) => hunk_failed = true,
+                    Err(ApplyError::Mangled { old, new }) => {
+                        return Err(format!(
+                            "Out-of-sync patch, lines {old},{new} -- mangled text or line numbers, maybe?"
+                        ));
+                    }
+                }
+            } else if !hunk_failed {
                 let at = where_line.unwrap_or(1);
                 match apply::apply_hunk(hunk, &lines, at, &mut output, &mut frozen) {
                     Ok(()) => out_offset += hunk.repl_lines - hunk.ptrn_lines,
@@ -1026,8 +1065,10 @@ impl Engine<'_> {
                     };
                     self.say(&format!("Hunk #{hunk_no} {what} at {newwhere}{endings}.\n"));
                 }
-            } else if self.opt.verbosity == Verbosity::Verbose
-                || (self.opt.verbosity != Verbosity::Silent && (fuzz_used != 0 || in_offset != 0))
+            } else if !self.opt.merge
+                && (self.opt.verbosity == Verbosity::Verbose
+                    || (self.opt.verbosity != Verbosity::Silent
+                        && (fuzz_used != 0 || in_offset != 0)))
             {
                 self.say_success(hunk_no, newwhere, fuzz_used, in_offset);
             }
@@ -1047,6 +1088,7 @@ impl Engine<'_> {
             reverse,
             reject,
             mismatch,
+            conflict,
         })
     }
 
@@ -1055,7 +1097,11 @@ impl Engine<'_> {
             .prefix_context
             .max(cursor.hunks[index].suffix_context)
             .max(0);
-        let max_fuzz = self.opt.fuzz.min(context);
+        let max_fuzz = if self.opt.merge {
+            0
+        } else {
+            self.opt.fuzz.min(context)
+        };
         let mut fuzz = 0i64;
         loop {
             let mut incr = true;
@@ -1183,7 +1229,11 @@ impl Engine<'_> {
             }
             return Ok(());
         }
-        if !zero && says_new == 2 && (self.opt.remove_empty || !self.opt.posix) {
+        if !zero
+            && says_new == 2
+            && (self.opt.remove_empty || !self.opt.posix)
+            && !(self.opt.merge && self.somefailed)
+        {
             self.somefailed = true;
             if self.opt.verbosity != Verbosity::Silent {
                 self.say(&format!(
