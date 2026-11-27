@@ -1,0 +1,9 @@
+{
+  "args": [
+    "--fuzz=0"
+  ],
+  "files": {
+    "a.txt": "zero\none\ntwo\nthree\nfour\nfive\nsix\n"
+  },
+  "stdin": "--- a.txt\n+++ a.txt\n@@ -1,7 +1,7 @@\n ZERO\n one\n two\n-three\n+THREE\n four\n five\n SIX\n"
+}
