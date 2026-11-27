@@ -1,0 +1,9 @@
+{
+  "args": [
+    "-p1"
+  ],
+  "files": {
+    "old.txt": "bye\n"
+  },
+  "stdin": "--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n"
+}

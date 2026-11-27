@@ -1,0 +1,5 @@
+{
+  "args": [],
+  "files": {},
+  "stdin": "--- /dev/null\n+++ new.txt\n@@ -0,0 +1,2 @@\n+alpha\n+beta\n"
+}
