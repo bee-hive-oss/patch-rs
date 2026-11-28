@@ -42,6 +42,9 @@ struct Engine<'a> {
     /// Inodes whose queued replacement must be flushed before they are read.
     queued_inodes: Vec<(u64, u64)>,
     was_git: bool,
+    /// Unit tests set this so `say` does not write the process stdout.
+    /// Cargo's harness prints on that fd while other tests finish.
+    capture: Option<Vec<u8>>,
 }
 
 struct Names {
@@ -121,14 +124,29 @@ struct StatBuf {
 }
 
 pub fn run(opt: &Options) -> i32 {
+    run_engine(opt, None).0
+}
+
+/// Same as [`run`], but `say` appends to a buffer instead of process stdout.
+#[cfg(test)]
+fn run_captured(opt: &Options) -> (i32, String) {
+    let (status, bytes) = run_engine(opt, Some(Vec::new()));
+    let output = String::from_utf8(bytes.unwrap_or_default())
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
+    (status, output)
+}
+
+fn run_engine(opt: &Options, capture: Option<Vec<u8>>) -> (i32, Option<Vec<u8>>) {
     let mut engine = Engine::new(opt);
-    match engine.execute() {
+    engine.capture = capture;
+    let status = match engine.execute() {
         Ok(code) => code,
         Err(message) => {
             engine.fatal_print(&message);
             cli::EXIT_TROUBLE
         }
-    }
+    };
+    (status, engine.capture)
 }
 
 impl<'a> Engine<'a> {
@@ -146,6 +164,7 @@ impl<'a> Engine<'a> {
             pending_outputs: Vec::new(),
             queued_inodes: Vec::new(),
             was_git: false,
+            capture: None,
         }
     }
 
@@ -1885,6 +1904,10 @@ impl Engine<'_> {
     }
 
     fn write_stdout(&mut self, bytes: &[u8]) {
+        if let Some(buf) = self.capture.as_mut() {
+            buf.extend_from_slice(bytes);
+            return;
+        }
         let mut out = io::stdout().lock();
         let _ = out.write_all(bytes);
         let _ = out.flush();
@@ -2418,11 +2441,9 @@ fn gnu_temp_label(path: &Path, seq: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::run_captured;
     use crate::cli::{self, ProcessEnv};
     use std::fs;
-    use std::io::{self, Read, Write};
-    use std::os::unix::io::FromRawFd;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -2443,81 +2464,7 @@ mod tests {
         argv.push("-i".to_string());
         argv.push(patch.display().to_string());
         let opt = cli::parse_with(&argv, &clean_env()).unwrap_or_else(|_| panic!("parse failed"));
-        let mut status = 0;
-        let output = capture_stdout(|| {
-            status = run(&opt);
-        });
-        (status, output)
-    }
-
-    /// `say` writes to the real stdout fd. The caller holds the test lock.
-    fn capture_stdout(body: impl FnOnce()) -> String {
-        let capture = StdoutCapture::start();
-        body();
-        capture.finish()
-    }
-
-    struct StdoutCapture {
-        saved: i32,
-        read: i32,
-        active: bool,
-    }
-
-    impl StdoutCapture {
-        fn start() -> Self {
-            let _ = io::stdout().flush();
-            let mut fds = [0i32; 2];
-            assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0, "pipe");
-            let saved = unsafe { dup(1) };
-            assert!(saved >= 0, "dup stdout");
-            assert_eq!(unsafe { dup2(fds[1], 1) }, 1, "redirect stdout");
-            assert_eq!(unsafe { close(fds[1]) }, 0, "close pipe write");
-            Self {
-                saved,
-                read: fds[0],
-                active: true,
-            }
-        }
-
-        fn finish(mut self) -> String {
-            let _ = io::stdout().flush();
-            self.restore();
-            let fd = self.read;
-            self.read = -1;
-            let mut file = unsafe { fs::File::from_raw_fd(fd) };
-            let mut out = Vec::new();
-            file.read_to_end(&mut out).unwrap();
-            String::from_utf8(out)
-                .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
-        }
-
-        fn restore(&mut self) {
-            if !self.active {
-                return;
-            }
-            unsafe {
-                dup2(self.saved, 1);
-                close(self.saved);
-            }
-            self.active = false;
-        }
-    }
-
-    impl Drop for StdoutCapture {
-        fn drop(&mut self) {
-            self.restore();
-            if self.read >= 0 {
-                unsafe { close(self.read) };
-                self.read = -1;
-            }
-        }
-    }
-
-    unsafe extern "C" {
-        fn pipe(fds: *mut i32) -> i32;
-        fn dup(fd: i32) -> i32;
-        fn dup2(oldfd: i32, newfd: i32) -> i32;
-        fn close(fd: i32) -> i32;
+        run_captured(&opt)
     }
 
     struct CwdGuard(PathBuf);
