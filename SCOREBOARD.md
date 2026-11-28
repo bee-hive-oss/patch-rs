@@ -37,6 +37,7 @@ Coverage columns added 2026-11-26. New rows include C lines %, C branches %, Rus
 | 2026-11-26 20:48 | `0559708` | 28 pass | clean | 47/49 | n/a | 45/49 | 76.4% | 65.3% | 81.1% | 69.2% | PR #44 merged Nov 26: Port --merge conflict output so the GNU merge script passes |
 | 2026-11-26 20:54 | `10d9f96` | 28 pass | clean | RED | n/a | 46/49 | 76.4% | 65.3% | 80.6% | 67.8% | PR #46 merged Nov 26: Set file times for --set-time and --set-utc so the GNU preserve-mode-and-timestamp script passes |
 | 2026-11-27 13:13 | `778d9f4` | 28 pass | clean | RED | n/a | 46/49 | 76.4% | 65.3% | 80.6% | 67.8% | PR #47 merged Nov 27: Switch GNU patch tarball fetch from ftp.gnu.org to ftpmirror.gnu.org |
+| 2026-11-27 21:13 | `4f55fa5` | 28 pass | clean | 47/49 | n/a | 46/49 | 76.4% | 65.3% | 80.6% | 67.8% | PR #50 merged Nov 27: Make the reverse-delete unit test capture only its own output |
 
 ## Upstream C bugs fixed
 
